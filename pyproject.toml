@@ -1,0 +1,36 @@
+[project]
+name = "saltapp-langflow"
+version = "0.1.0"
+description = "Langflow custom components exposing Salt (saltapp.ai) agent actions: send an end-to-end encrypted message, ask a human and wait for the tap, request payment, and poll for new Salt events."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "0x0000F8", email = "0000F8@proton.me" }]
+keywords = ["langflow", "salt", "saltapp", "agents", "human-in-the-loop"]
+
+dependencies = [
+    # saltapp is not yet on PyPI (see https://github.com/0000F8/saltapp-python) --
+    # this git dependency will be replaced by a normal version pin once it
+    # ships there.
+    "saltapp @ git+https://github.com/0000F8/saltapp-python@main",
+]
+
+[project.optional-dependencies]
+# `lfx` is deliberately NOT a base runtime dependency: this package is
+# meant to be dropped into an existing Langflow/lfx install (see README.md,
+# "Loading these components"), which already provides it. Installing it
+# here too is only for this repo's own development and test suite.
+dev = [
+    "lfx>=1.0",
+    "pytest>=7",
+]
+
+[project.urls]
+Homepage = "https://saltapp.ai"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["saltapp_langflow*"]
