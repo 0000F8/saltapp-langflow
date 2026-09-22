@@ -1,27 +1,28 @@
-# Salt Trigger/Listen: poll this agent's Salt updates for the next new,
-# verified event since the last time this component ran, instead of
-# Langflow's built-in Webhook component -- see AGENTS.md and README.md for
-# why (short version: Webhook exposes only the request BODY, never
-# headers, and Salt's signature lives in a header; an unverified
-# card_interaction/invoice_paid/chat_opened payload is plaintext and
-# actionable, so it must never be trusted unverified).
+# Salt Read Updates (was Salt Trigger/Listen): read this agent's Salt
+# updates for whatever is new since the last check, in exactly ONE call,
+# instead of Langflow's built-in Webhook component. See AGENTS.md and
+# README.md for why not the built-in Webhook (short version: Webhook
+# exposes only the request BODY, never headers, and Salt's signature
+# lives in a header; an unverified card_interaction/invoice_paid/
+# chat_opened payload is plaintext and actionable, so it must never be
+# trusted unverified).
+#
+# On demand, not poll-and-wait: this component's build method runs once
+# per flow invocation and returns immediately with whatever one
+# GET /api/v1/agent/updates call finds -- no loop, no sleep, no wait
+# budget. It is meant to sit at the start of a flow that is itself
+# triggered on its own schedule/cron/manual run and pick up whatever is
+# new since last time. Genuine push needs a persistent process outside
+# this package; see README.md's "Push vs. on-demand" section.
 from __future__ import annotations
 
 from typing import Any
 
 from lfx.custom.custom_component.component import Component
-from lfx.io import IntInput, MessageTextInput, MultilineSecretInput, Output, SecretStrInput, StrInput
+from lfx.io import MessageTextInput, MultilineSecretInput, Output, SecretStrInput, StrInput
 from lfx.schema.data import Data
 
 from . import _salt_common as sc
-
-# A "listen" component is meant to sit at the start of a flow that is
-# itself triggered on its own schedule/cron/manual run and pick up
-# whatever is new since last time -- not to hold a request open for
-# minutes. Capped well under a minute so it plays nicely with whatever
-# fronts this Langflow run (a browser tab, a reverse proxy, a scheduler).
-MAX_WAIT_SECONDS = 55
-DEFAULT_WAIT_SECONDS = 25
 
 KNOWN_EVENT_TYPES = {
     "message",
@@ -33,14 +34,14 @@ KNOWN_EVENT_TYPES = {
 }
 
 
-class SaltListenComponent(Component):
-    display_name = "Salt Trigger/Listen"
+class SaltReadUpdatesComponent(Component):
+    display_name = "Salt Read Updates"
     description = (
-        "Poll this agent's Salt updates for the next new event (message, card tap, payment, "
-        "chat opened, or hand-off) since the last run, verifying its signature first."
+        "Check once for this agent's new Salt events (message, card tap, payment, chat opened, or "
+        "hand-off) since the last check, verifying each one's signature first."
     )
     icon = "radio"
-    name = "SaltListen"
+    name = "SaltReadUpdates"
 
     inputs = [
         StrInput(
@@ -52,7 +53,7 @@ class SaltListenComponent(Component):
         StrInput(
             name="agent_id",
             display_name="Agent ID",
-            info="This agent's own Salt id, used to namespace this component's local poll-cursor file.",
+            info="This agent's own Salt id, used to namespace this component's local check-cursor file.",
         ),
         SecretStrInput(
             name="api_key",
@@ -74,28 +75,21 @@ class SaltListenComponent(Component):
             required=False,
             info="Not needed here -- this component never decrypts anything.",
         ),
-        IntInput(
-            name="wait_seconds",
-            display_name="Wait Seconds",
-            value=DEFAULT_WAIT_SECONDS,
-            info=f"How long to keep polling for a new event before returning empty. Capped at {MAX_WAIT_SECONDS}s.",
-        ),
         MessageTextInput(
             name="event_types",
             display_name="Event Types",
             required=False,
             info=(
-                "Comma-separated event types to wait for: message, card_interaction, invoice_paid, "
+                "Comma-separated event types to look for: message, card_interaction, invoice_paid, "
                 "chat_opened, handoff_confirmed, handoff_received. Blank means any of them."
             ),
         ),
     ]
 
-    outputs = [Output(display_name="Event", name="event", method="listen")]
+    outputs = [Output(display_name="Events", name="events", method="read")]
 
-    def listen(self) -> Data:
+    def read(self) -> Data:
         wanted = {t for t in sc.parse_options(self.event_types) if t in KNOWN_EVENT_TYPES}
-        wait_seconds = min(max(0, int(self.wait_seconds or 0)), MAX_WAIT_SECONDS)
 
         client = sc.get_client(self.host)
         try:
@@ -112,32 +106,37 @@ class SaltListenComponent(Component):
                 return not wanted or event.type in wanted
 
             # Shared with Salt Ask Human's own cursor -- see
-            # sc.SHARED_POLL_PURPOSE's docstring: there is only one ack per
-            # agent server-side, so this package's local bookkeeping now
-            # matches that instead of pretending each component has its own.
+            # sc.SHARED_POLL_PURPOSE's docstring: there is only one ack
+            # per agent server-side, so this package's local bookkeeping
+            # matches that instead of pretending each component has its
+            # own.
             cursor = sc.PersistentCursor(sc.state_dir(agent_id, sc.SHARED_POLL_PURPOSE) / "cursor.json")
-            event = sc.poll_for_event(
+            events, _new_cursor = sc.check_for_event(
                 client,
                 self.api_key,
                 secret=secret,
                 cursor=cursor,
-                wait_seconds=wait_seconds,
                 predicate=matches,
             )
         finally:
             client.close()
 
-        if event is None:
-            self.status = f"No new events within {wait_seconds}s."
-            return Data(data={"status": "no_new_events"})
+        if not events:
+            self.status = "No new events since last check."
+            return Data(data={"status": "no_new_events", "events": []})
 
-        self.status = f"New {event.type} event (delivery {event.delivery_id})."
+        self.status = f"{len(events)} new event(s)."
         return Data(
             data={
-                "status": "event",
-                "event_type": event.type,
-                "delivery_id": event.delivery_id,
-                "created_at": event.created_at,
-                "body": event.body,
+                "status": "events",
+                "events": [
+                    {
+                        "event_type": event.type,
+                        "delivery_id": event.delivery_id,
+                        "created_at": event.created_at,
+                        "body": event.body,
+                    }
+                    for event in events
+                ],
             }
         )

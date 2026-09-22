@@ -1,7 +1,8 @@
 # Shared helpers for every Salt (saltapp.ai) Langflow component in this
 # package: building a client, resolving an agent's own identity, the
-# encrypted-send helper (Salt Send Message), and the short-poll helper both
-# Salt Ask Human and Salt Trigger/Listen use to wait for a verified event.
+# send helper (Salt Send Message, plain or encrypted depending on the
+# room), the open-room read helper (Salt Read Room), and the single-shot
+# event-check helper (Salt Ask Human, Salt Read Updates).
 #
 # Deliberately thin: every real Salt call goes straight through
 # `saltapp.client.SaltClient` with plain strings pulled from a component's
@@ -9,11 +10,20 @@
 # `saltapp.integrations.*` (that layer is built for a persistent
 # framework-agent process; a Langflow component runs once per flow
 # invocation, so it does not fit). See AGENTS.md for the full rationale.
+#
+# NO POLLING, anywhere in this module (2026-09-22 rewrite -- the owner's
+# explicit rule, via the task coordinator): a Langflow component's build
+# method is a single stateless call with no persistent process behind it,
+# so it must never loop or sleep waiting for something to happen. The old
+# `poll_for_event` (a `while True: ... time.sleep(...)` short-poll loop)
+# is gone; `check_for_event` below makes exactly ONE
+# `GET /api/v1/agent/updates` call per invocation and returns immediately
+# with whatever it finds. Genuine push still needs a persistent process
+# outside this package -- see README.md's "Push vs. on-demand" section.
 from __future__ import annotations
 
 import json
 import os
-import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -38,10 +48,12 @@ KEYLESS_INFO = (
     "reads or decrypts message text."
 )
 
-# One poll round's short-poll timeout passed to the server (clamped there to
-# 0..2s regardless of what is sent -- see SaltClient.get_agent_updates).
+# The one check_for_event round's server-side timeout, passed straight to
+# GET /api/v1/agent/updates (clamped there to 0..2s regardless of what is
+# sent -- see SaltClient.get_agent_updates). This is a single HTTP
+# request's timeout, not a client-side retry budget -- there is no retry
+# loop in this module.
 _POLL_TIMEOUT_SECONDS = 2
-_POLL_SLEEP_SECONDS = 1.0
 
 # Deliberately NOT `saltapp.socket.SOCKET_SIGNATURE_TOLERANCE_SECONDS`: that
 # constant is still the pre-round-4 widened value (7 days + 1h) as of this
@@ -90,6 +102,55 @@ def parse_options(raw: str | None) -> list[str]:
     return [item.strip() for item in (raw or "").split(",") if item.strip()]
 
 
+def send_message(
+    client: SaltClient,
+    *,
+    api_key: str,
+    agent_id: str,
+    chat_id: str,
+    text: str,
+    mentions: list[str] | None = None,
+    quiet: bool = False,
+) -> dict[str, Any]:
+    """Post `text` into `chat_id`, choosing plain or encrypted delivery
+    from the chat's own `session.encrypted` flag (saltapp 0.2.0's open
+    rooms): plain text via `SaltClient.post_plain_message` for an open
+    (`encrypted: false`) room, PGP-encrypted-for-every-member via
+    `send_encrypted_message` (below) otherwise. Missing `encrypted`
+    defaults to True (encrypted) -- every room before 0.2.0 was encrypted
+    and had no such key at all, so treating "not present" as "not open"
+    is the safe read of an old or partial response shape.
+
+    One `client.get_chat` call up front serves double duty: it is how we
+    learn whether the room is open, and -- for the encrypted branch --
+    its `session["users"]` is the SAME member list `get_chat_members`
+    would otherwise fetch with a second round trip (per saltapp-python's
+    own `client.py`, `get_chat_members` is literally
+    `get_chat(...)["session"]["users"]`). We pass that list straight
+    through to `send_encrypted_message` and only fall back to a fresh
+    `get_chat_members` call if `session` has no `"users"` key at all -- a
+    defensive fallback for a response shape this SDK version does not
+    guarantee, which should never actually fire today.
+    """
+    chat = client.get_chat(api_key, chat_id)
+    session = chat.get("session") or {}
+
+    if not session.get("encrypted", True):
+        return client.post_plain_message(api_key, chat_id, text, mentions=mentions, quiet=quiet)
+
+    members = session["users"] if "users" in session else client.get_chat_members(api_key, chat_id)
+    return send_encrypted_message(
+        client,
+        api_key=api_key,
+        agent_id=agent_id,
+        chat_id=chat_id,
+        text=text,
+        mentions=mentions,
+        quiet=quiet,
+        members=members,
+    )
+
+
 def send_encrypted_message(
     client: SaltClient,
     *,
@@ -99,6 +160,7 @@ def send_encrypted_message(
     text: str,
     mentions: list[str] | None = None,
     quiet: bool = False,
+    members: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Encrypt `text` for every other member of `chat_id` and post it.
 
@@ -109,8 +171,15 @@ def send_encrypted_message(
     is among the members, a self-copy so this agent's own history stays
     legible. Raises SaltApiError if nobody else in the chat has a public
     key on file yet.
+
+    `members` lets a caller that already has the chat's member list (for
+    example `send_message()` above, which fetches the chat once to read
+    `session.encrypted`) pass it straight through instead of paying for a
+    second `get_chat_members` round trip; omit it (the default) to fetch
+    fresh, as this function always did before `send_message()` existed.
     """
-    members = client.get_chat_members(api_key, chat_id)
+    if members is None:
+        members = client.get_chat_members(api_key, chat_id)
     self_id = str(agent_id or "").lower()
     recipient_keys: list[str] = []
     own_public_key: str | None = None
@@ -134,6 +203,20 @@ def send_encrypted_message(
     encrypted = crypto.encrypt_for(text, recipient_keys)
     sender_copy = crypto.encrypt_for(text, [own_public_key]) if own_public_key else None
     return client.post_message(api_key, chat_id, encrypted, sender_copy, mentions=mentions, quiet=quiet)
+
+
+def read_room(client: SaltClient, api_key: str | None, chat_id: str, last: Any = None) -> dict[str, Any]:
+    """Thin wrapper over `SaltClient.get_chat` for Salt Read Room -- kept
+    here, rather than inlined in the component, for consistency with how
+    `send_message`/`send_encrypted_message` live in this shared module
+    instead of inline in theirs. `api_key` may be falsy (`""` or `None`):
+    `SaltClient._request` then sends NO api-key header at all, which
+    works read-only against a `public && !encrypted` ("open") room -- see
+    `SaltClient.get_chat`'s own docstring. `last`, when given, is a
+    message `seq` cursor: only messages newer than it come back, instead
+    of the ten most recent.
+    """
+    return client.get_chat(api_key or "", chat_id, last=last)
 
 
 def build_question_card(question: str, options: list[str]) -> list[dict[str, Any]]:
@@ -211,82 +294,74 @@ def _row_raw_bytes(update: dict[str, Any]) -> bytes:
     return json.dumps(raw_body or {}).encode("utf-8")
 
 
-def poll_for_event(
+def check_for_event(
     client: SaltClient,
     api_key: str,
     *,
     secret: str,
     cursor: PersistentCursor,
-    wait_seconds: float,
-    predicate: Callable[[Event], bool],
-    sleep_seconds: float = _POLL_SLEEP_SECONDS,
+    predicate: Callable[[Event], bool] | None = None,
     tolerance_seconds: int = POLL_SIGNATURE_TOLERANCE_SECONDS,
-) -> Event | None:
-    """Short-poll `GET /api/v1/agent/updates` (the same K2 socket-mode
-    contract `saltapp.socket.SocketClient` uses) for up to `wait_seconds`,
-    verifying each row's signature at the standard tolerance (see
-    POLL_SIGNATURE_TOLERANCE_SECONDS's own comment for why this is NOT the
-    wider one `saltapp.socket` still uses), and returns the first `Event`
-    for which `predicate(event)` is true, or None if `wait_seconds` elapses
-    first.
+) -> tuple[list[Event], int]:
+    """Single-shot replacement for the old `poll_for_event` sleeping loop
+    (removed 2026-09-22 per the owner's explicit "no polling, ever" rule
+    -- see this module's own docstring, and AGENTS.md's "The ask/check
+    design"). Makes exactly ONE `GET /api/v1/agent/updates` call -- no
+    loop, no `time.sleep`, no wait budget of any kind -- verifies every
+    row's signature at `tolerance_seconds`, and returns every event that
+    matches `predicate` (or every verified event, if `predicate` is
+    `None`) found in that one response page.
 
-    The cursor advances past every row seen in every round -- including
-    rows the predicate rejected and the one it matched -- so a later call
-    never re-delivers what this call already returned or discarded.
+    The (local) cursor advances past every row seen in this one round --
+    including rows `predicate` rejected and rows that failed verification
+    -- exactly like the old loop's per-round advance, so a LATER call
+    never re-processes what this call already consumed. Persisted via
+    `cursor.set(...)` before returning.
 
-    One deliberate simplification versus `saltapp.socket.SocketClient`:
-    that class HALTS (never advancing its cursor) on a row that fails
-    verification, because it is a long-running daemon that can retry
-    indefinitely. This helper instead skips a bad row and keeps going --
-    a bounded `wait_seconds` wait cannot afford to halt forever on one
-    unverifiable row while a human or a flow is waiting on the other end.
+    One deliberate simplification, inherited from `poll_for_event`: a row
+    that fails signature verification is skipped, not fatal -- a single
+    on-demand call has no "next round" to retry it in, so treating an
+    unverifiable row as fatal would just make this component fail outright
+    on the next call after any one bad row, rather than skip past it once.
+
+    Returns `(matches, new_cursor)`. `matches` is a list, not a single
+    `Event` -- unlike the old loop (which stopped at the first predicate
+    hit because it needed to decide whether to keep waiting), a one-shot
+    check has nothing to gain by stopping early, so it collects everything
+    this round actually saw.
     """
-    deadline = time.monotonic() + max(0.0, wait_seconds)
     after = cursor.get()
-    match: Event | None = None
+    matches: list[Event] = []
 
-    while True:
+    response = client.get_agent_updates(api_key, after=after, timeout=_POLL_TIMEOUT_SECONDS, limit=100)
+    updates = response.get("updates") or []
+    server_cursor = response.get("cursor", after)
+
+    for update in updates:
+        row_id = update.get("id")
+        headers = update.get("headers") or {}
         try:
-            response = client.get_agent_updates(api_key, after=after, timeout=_POLL_TIMEOUT_SECONDS, limit=100)
-        except SaltApiError:
-            raise  # a real API failure (bad api-key, unreachable host) -- surface it, don't swallow it as "no answer".
-        except Exception:  # noqa: BLE001 -- a transport hiccup; retry within the remaining wait.
-            if time.monotonic() >= deadline:
-                return None
-            time.sleep(sleep_seconds)
-            continue
-
-        updates = response.get("updates") or []
-        server_cursor = response.get("cursor", after)
-
-        for update in updates:
-            row_id = update.get("id")
-            headers = update.get("headers") or {}
-            try:
-                event = handle_webhook(
-                    headers,
-                    _row_raw_bytes(update),
-                    secret=secret,
-                    verify=True,
-                    tolerance_seconds=tolerance_seconds,
-                )
-            except WebhookVerificationError:
-                if row_id is not None:
-                    after = row_id
-                continue
-            if update.get("delivery_id") is not None:
-                event.delivery_id = str(update["delivery_id"])
-            if update.get("created_at") is not None:
-                event.created_at = str(update["created_at"])
+            event = handle_webhook(
+                headers,
+                _row_raw_bytes(update),
+                secret=secret,
+                verify=True,
+                tolerance_seconds=tolerance_seconds,
+            )
+        except WebhookVerificationError:
             if row_id is not None:
                 after = row_id
-            if match is None and predicate(event):
-                match = event
+            continue
+        if update.get("delivery_id") is not None:
+            event.delivery_id = str(update["delivery_id"])
+        if update.get("created_at") is not None:
+            event.created_at = str(update["created_at"])
+        if row_id is not None:
+            after = row_id
+        if predicate is None or predicate(event):
+            matches.append(event)
 
-        cursor.set(server_cursor if server_cursor is not None else after)
+    new_cursor = server_cursor if server_cursor is not None else after
+    cursor.set(new_cursor)
 
-        if match is not None:
-            return match
-        if time.monotonic() >= deadline:
-            return None
-        time.sleep(sleep_seconds)
+    return matches, new_cursor

@@ -1,7 +1,7 @@
 [project]
 name = "saltapp-langflow"
 version = "0.1.0"
-description = "Langflow custom components exposing Salt (saltapp.ai) agent actions: send an end-to-end encrypted message, ask a human and wait for the tap, request payment, and poll for new Salt events."
+description = "Langflow custom components exposing Salt (saltapp.ai) agent actions: send a message (encrypted or, in an open room, plain), ask a human and check for the tap, request payment, read a room on demand, manage interests, and check for new Salt events."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -11,7 +11,15 @@ keywords = ["langflow", "salt", "saltapp", "agents", "human-in-the-loop"]
 dependencies = [
     # saltapp is not yet on PyPI (see https://github.com/0000F8/saltapp-python) --
     # this git dependency will be replaced by a normal version pin once it
-    # ships there.
+    # ships there. Floor is effectively >=0.2.0 (open rooms: get_chat's
+    # `last` cursor and no-api-key reads, post_plain_message,
+    # get_chat_subscription/set_chat_subscription/clear_chat_subscription)
+    # -- PEP 508 does not allow combining a version specifier with a
+    # direct URL reference, so that floor is documented here rather than
+    # pinned on the line below. Until saltapp-python's `lane/open-rooms`
+    # branch merges to its own `main`, local dev against this repo
+    # installs the sibling editable checkout instead of this git URL:
+    # `.venv/bin/pip install -e /path/to/saltapp-python`.
     "saltapp @ git+https://github.com/0000F8/saltapp-python@main",
 ]
 

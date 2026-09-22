@@ -1,6 +1,8 @@
-# Salt Send Message: post an end-to-end encrypted plaintext message into a
-# Salt chat. See _salt_common.send_encrypted_message for the actual logic
-# (fetch chat members, encrypt for everyone but this agent, post).
+# Salt Send Message: post `text` into a Salt chat, plain or end-to-end
+# encrypted depending on the room (saltapp 0.2.0's open rooms). See
+# _salt_common.send_message for the actual logic (checks the chat's
+# `session.encrypted` flag, then either posts plain or encrypts for every
+# member and posts).
 from __future__ import annotations
 
 from lfx.custom.custom_component.component import Component
@@ -71,7 +73,7 @@ class SaltSendMessageComponent(Component):
     def send(self) -> Message:
         client = sc.get_client(self.host)
         try:
-            result = sc.send_encrypted_message(
+            result = sc.send_message(
                 client,
                 api_key=self.api_key,
                 agent_id=self.agent_id,
@@ -82,6 +84,25 @@ class SaltSendMessageComponent(Component):
         finally:
             client.close()
 
+        # The API echoes `encrypted`/`delivered_because` on the message it
+        # just created (same fields `get_chat`'s own `messages` carry, see
+        # saltapp-python's CHANGELOG 0.2.0) -- read them straight off the
+        # response if present, rather than recomputing what we already
+        # decided in sc.send_message, so the status line always reflects
+        # what the server actually did.
         message_id = result.get("id") or (result.get("message") or {}).get("id")
-        self.status = f"Sent to chat {self.chat_id} (message id {message_id})."
+        payload = result if "encrypted" in result else (result.get("message") or {})
+        encrypted = payload.get("encrypted")
+        delivered_because = payload.get("delivered_because")
+        if encrypted is False:
+            mode = "plain (open room)"
+        elif encrypted is True:
+            mode = "encrypted"
+        else:
+            mode = None
+        detail = f", delivered because {delivered_because}" if delivered_because else ""
+        if mode:
+            self.status = f"Sent {mode} to chat {self.chat_id} (message id {message_id}){detail}."
+        else:
+            self.status = f"Sent to chat {self.chat_id} (message id {message_id})."
         return Message(text=f"Sent to chat {self.chat_id}.")

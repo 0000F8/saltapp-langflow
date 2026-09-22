@@ -5,7 +5,7 @@
 # recording every call so a test can assert on it. `signed_update_row`
 # builds a socket-mode "update" row with a REAL HMAC signature (the exact
 # scheme `saltapp.webhook.verify_signature` checks), so tests exercise the
-# actual signature-verification path in `_salt_common.poll_for_event`
+# actual signature-verification path in `_salt_common.check_for_event`
 # rather than mocking it away -- matching saltapp-python's own testing
 # philosophy (AGENTS.md: "None of them stub the thing they claim to test").
 from __future__ import annotations
@@ -36,9 +36,14 @@ class FakeSaltClient:
 
         self.who_am_i_response: dict[str, Any] = {"agent_id": "agent-self", "webhook_secret": WEBHOOK_SECRET}
         self.chat_members_response: list[dict[str, Any]] = []
+        self.get_chat_response: dict[str, Any] = {"session": {"encrypted": True, "users": []}, "messages": []}
         self.post_message_response: dict[str, Any] = {"id": "msg-1"}
+        self.post_plain_message_response: dict[str, Any] = {"id": "msg-plain-1"}
         self.post_card_response: dict[str, Any] = {"id": "card-1"}
         self.request_payment_response: dict[str, Any] = {"id": "req-1"}
+        self.get_chat_subscription_response: dict[str, Any] = {"chat_id": "chat-1", "mode": "addressed", "keywords": []}
+        self.set_chat_subscription_response: dict[str, Any] = {"chat_id": "chat-1", "mode": "addressed", "keywords": []}
+        self.clear_chat_subscription_response: dict[str, Any] = {"chat_id": "chat-1", "mode": "addressed", "keywords": []}
         # A list of "rounds": each call to get_agent_updates pops the next
         # round (or repeats the last one once the list is exhausted).
         self.update_rounds: list[dict[str, Any]] = [{"updates": [], "cursor": 0}]
@@ -58,6 +63,10 @@ class FakeSaltClient:
         self._record("get_chat_members", api_key, chat_id)
         return self.chat_members_response
 
+    def get_chat(self, api_key: str, chat_id: str, *, last: Any = None) -> dict[str, Any]:
+        self._record("get_chat", api_key, chat_id, last=last)
+        return self.get_chat_response
+
     def post_message(
         self,
         api_key: str,
@@ -69,6 +78,10 @@ class FakeSaltClient:
         self._record("post_message", api_key, chat_id, message, sender_message, **kwargs)
         return self.post_message_response
 
+    def post_plain_message(self, api_key: str, chat_id: str, message: str, **kwargs: Any) -> dict[str, Any]:
+        self._record("post_plain_message", api_key, chat_id, message, **kwargs)
+        return self.post_plain_message_response
+
     def post_card(self, api_key: str, chat_id: str, blocks: list[dict[str, Any]], text: str) -> dict[str, Any]:
         self._record("post_card", api_key, chat_id, blocks, text)
         return self.post_card_response
@@ -76,6 +89,20 @@ class FakeSaltClient:
     def request_payment(self, api_key: str, **kwargs: Any) -> dict[str, Any]:
         self._record("request_payment", api_key, **kwargs)
         return self.request_payment_response
+
+    def get_chat_subscription(self, api_key: str, chat_id: str) -> dict[str, Any]:
+        self._record("get_chat_subscription", api_key, chat_id)
+        return self.get_chat_subscription_response
+
+    def set_chat_subscription(
+        self, api_key: str, chat_id: str, mode: str, *, keywords: list[str] | None = None
+    ) -> dict[str, Any]:
+        self._record("set_chat_subscription", api_key, chat_id, mode, keywords=keywords)
+        return self.set_chat_subscription_response
+
+    def clear_chat_subscription(self, api_key: str, chat_id: str) -> dict[str, Any]:
+        self._record("clear_chat_subscription", api_key, chat_id)
+        return self.clear_chat_subscription_response
 
     def get_agent_updates(self, api_key: str, *, after: int = 0, timeout: int = 2, limit: int = 100) -> dict[str, Any]:
         self._record("get_agent_updates", api_key, after=after, timeout=timeout, limit=limit)
@@ -89,7 +116,7 @@ def sign_body(body: dict[str, Any], secret: str = WEBHOOK_SECRET, *, timestamp: 
     """The exact `X-Salt-Signature: t=..,v1=..` scheme saltapp.webhook checks.
     Returns (headers, raw_json_string) -- the raw string is what a test
     should also put in the update row's `body`, so the bytes hashed for the
-    signature match the bytes `_salt_common.poll_for_event` re-hashes."""
+    signature match the bytes `_salt_common.check_for_event` re-hashes."""
     ts = timestamp if timestamp is not None else int(time.time())
     raw = json.dumps(body)
     signed_string = f"{ts}.".encode() + raw.encode("utf-8")
@@ -130,12 +157,3 @@ def _isolate_state(tmp_path, monkeypatch):
     sc.reset_whoami_cache()
     yield
     sc.reset_whoami_cache()
-
-
-@pytest.fixture(autouse=True)
-def _no_real_sleep(monkeypatch):
-    """poll_for_event sleeps between rounds; tests keep wait_seconds at 0
-    (one round, deterministic) so this never actually needs to fire, but
-    patching it out removes any chance of a slow/flaky test if that ever
-    changes."""
-    monkeypatch.setattr(sc.time, "sleep", lambda _seconds: None)

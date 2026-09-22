@@ -11,10 +11,14 @@ __all__ = [
     "SaltSendMessageComponent",
     "SaltAskHumanComponent",
     "SaltRequestPaymentComponent",
-    "SaltListenComponent",
+    "SaltReadUpdatesComponent",
+    "SaltReadRoomComponent",
+    "SaltInterestsComponent",
 ]
 
 from .ask_human import SaltAskHumanComponent
-from .listen import SaltListenComponent
+from .interests import SaltInterestsComponent
+from .read_room import SaltReadRoomComponent
+from .read_updates import SaltReadUpdatesComponent
 from .request_payment import SaltRequestPaymentComponent
 from .send_message import SaltSendMessageComponent
