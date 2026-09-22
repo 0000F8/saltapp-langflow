@@ -19,17 +19,42 @@
   correctly rejected.
 - **This package's own poll loop (`poll_for_event`) was already correctly
   aligned otherwise**: 2s round timeout ("clamped there to 0..2s
-  regardless of what is sent"), 1s between rounds, a real cursor
-  (`PersistentCursor`) persisted to disk across component runs. NOT fixed
-  (out of this repo's scope): `saltapp.client.SaltClient.get_agent_updates`
-  (in the separate `saltapp-python` package this depends on via git)
-  always sends `after=<cursor>` literally, including `after=0` on a fresh
-  cursor, instead of omitting it so salt-api's server-side ack applies.
-  Flagged to the coordinator; not this repo's file to fix.
+  regardless of what is sent"), 1s between rounds (kept fixed, not made
+  adaptive -- team-lead's ruling: Ask Human/Listen are bounded ≤50-55s
+  waits, a different shape from a long-lived listener, so backing off
+  toward 5s would just eat into an already-short budget), a real cursor
+  (`PersistentCursor`) persisted to disk across component runs.
+  ~~NOT fixed... `SaltClient.get_agent_updates` always sends `after=0`...~~
+  **Corrected by the coordinator after a live production check**: `after=0`
+  and omitting the param resolve identically server-side
+  (`resolved = max(agent_updates_acked_id, after.clamp(0, newest))`), so
+  `saltapp.client.SaltClient.get_agent_updates`'s current behavior needed
+  no change here. What actually matters, confirmed against production: the
+  ack only advances on an EXPLICIT, monotonically increasing `after` --
+  this package's cursor already does that correctly (see the new shared-
+  cursor fix below, and `tests/test_shared_cursor.py`'s "a second poll
+  does not redeliver processed rows" test).
+- **Fixed a real bug this same production check surfaced: Ask Human and
+  Listen used to poll through SEPARATE local cursor files
+  (`purpose="ask_human"` vs `"listen"`), implying two independent
+  positions that don't actually exist server-side** -- salt-api keeps
+  exactly ONE ack per agent, not one per caller/purpose, so one
+  component's poll could silently advance the real (shared) ack past rows
+  the other component's own, staler local file still expected to see --
+  those rows are then gone for good (the ack never rewinds). Both
+  components now share one cursor file (`sc.SHARED_POLL_PURPOSE`).
+  This does NOT make it safe to run them (or two Ask Human calls)
+  concurrently against the same agent_id -- there is still only one true
+  ack, sharing the file just stops this package's own bookkeeping from
+  lying about it. Documented prominently in AGENTS.md and README.md; no
+  lock exists or was added (a Langflow component has no natural place to
+  hold one across concurrent flow executions -- serialize at the
+  flow-orchestration level if you need concurrent polling against one
+  agent). 3 new tests in `tests/test_shared_cursor.py`.
 - No brand-icon fix here: Langflow components reference a bundled Lucide
   icon by name (`icon = "radio"`, `"send"`, etc.), not a custom SVG asset
   slot -- there's nothing hand-drawn to replace.
-- 13 -> 17 tests passing.
+- 13 -> 20 tests passing.
 
 ---
 

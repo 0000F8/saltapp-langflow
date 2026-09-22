@@ -161,6 +161,23 @@ def state_dir(agent_id: str, purpose: str) -> Path:
     return directory
 
 
+# Salt Ask Human and Salt Trigger/Listen both poll the SAME agent's outbox
+# through the SAME server-side ack (salt-api keeps exactly one
+# `agent_updates_acked_id` per agent, not one per caller/purpose -- a poll
+# with `after=X` moves it to `max(current_ack, X)`, and the server serves
+# from that resolved position regardless of what a caller's own `after`
+# said). Separate per-component cursor FILES used to imply two independent
+# positions that don't actually exist server-side: if one component's poll
+# advances the shared ack past rows the OTHER component's own (staler)
+# local file still expected to see, that request gets silently resolved
+# past them and never sees them. Sharing one cursor file makes this
+# package's own bookkeeping match the one true position the server already
+# enforces -- it does not, by itself, make it SAFE to run two of these
+# components concurrently against the same agent_id (a genuine "one poller
+# per agent" constraint remains; see AGENTS.md/README.md).
+SHARED_POLL_PURPOSE = "poll"
+
+
 class PersistentCursor:
     """A tiny file-backed high-water-mark: one integer, so a later flow run
     (Salt Ask Human's next call, or Salt Trigger/Listen's next poll) does

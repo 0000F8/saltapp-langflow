@@ -148,6 +148,14 @@ the built-in Webhook component" below for why.
 - Meant to sit at the start of a flow that is itself triggered on its own
   schedule, cron, or manual run, and pick up whatever is new since last
   time -- not to hold one HTTP request open for a long time.
+- **Shares its poll cursor with Salt Ask Human, and shares its underlying
+  "one ack per agent" with anything else polling this same Salt agent
+  (salt-api keeps a single stored position per agent, not one per caller).
+  Don't run Salt Ask Human and Salt Trigger/Listen concurrently against
+  the same agent, and don't run two Ask Human calls concurrently on it
+  either** -- see AGENTS.md's "File-based cursor state" for what actually
+  goes wrong (a missed event, not just wasted work) and why this package
+  has no way to enforce it for you.
 
 ## Working keyless
 

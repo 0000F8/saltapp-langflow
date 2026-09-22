@@ -124,7 +124,11 @@ class SaltAskHumanComponent(Component):
                 # A tap from another agent never resolves a pending HUMAN ask.
                 return str(tapper.get("account_type") or "").lower() != "agent"
 
-            cursor = sc.PersistentCursor(sc.state_dir(agent_id, "ask_human") / "cursor.json")
+            # Shared with Salt Trigger/Listen's own cursor -- see
+            # SHARED_POLL_PURPOSE's docstring: there is only one ack per
+            # agent server-side, so this package's local bookkeeping now
+            # matches that instead of pretending each component has its own.
+            cursor = sc.PersistentCursor(sc.state_dir(agent_id, sc.SHARED_POLL_PURPOSE) / "cursor.json")
             event = sc.poll_for_event(
                 client,
                 self.api_key,

@@ -111,7 +111,11 @@ class SaltListenComponent(Component):
                     return False
                 return not wanted or event.type in wanted
 
-            cursor = sc.PersistentCursor(sc.state_dir(agent_id, "listen") / "cursor.json")
+            # Shared with Salt Ask Human's own cursor -- see
+            # sc.SHARED_POLL_PURPOSE's docstring: there is only one ack per
+            # agent server-side, so this package's local bookkeeping now
+            # matches that instead of pretending each component has its own.
+            cursor = sc.PersistentCursor(sc.state_dir(agent_id, sc.SHARED_POLL_PURPOSE) / "cursor.json")
             event = sc.poll_for_event(
                 client,
                 self.api_key,

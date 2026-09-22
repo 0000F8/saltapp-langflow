@@ -93,20 +93,46 @@ correlate against, since it is meant to observe whatever happens.
 `_salt_common.PersistentCursor` is a one-integer JSON file under
 `~/.salt/agents/<agent_id>/langflow/<purpose>/cursor.json` (override root
 via `SALTAPP_LANGFLOW_STATE_DIR`, which the test suite uses to avoid
-touching a real home directory). `<purpose>` is `"ask_human"` or
-`"listen"` so the two components never share (and stomp on) each other's
-position in the same agent's update stream. This lives in the same
-`~/.salt/agents/` tree `saltapp.socket`'s own file-backed cursor/dedupe
-stores use, but under a `langflow/` subdirectory specifically so this
-package's cursor files never collide with a socket-mode `Agent`'s own
-files for the same agent id, if both happen to run against the same
-account on the same machine.
+touching a real home directory). This lives in the same `~/.salt/agents/`
+tree `saltapp.socket`'s own file-backed cursor/dedupe stores use, but
+under a `langflow/` subdirectory specifically so this package's cursor
+files never collide with a socket-mode `Agent`'s own files for the same
+agent id, if both happen to run against the same account on the same
+machine.
 
-This is a **performance optimization, not a correctness requirement**:
-every poll loop still matches on something specific (a card_id, a
-requested event type), so re-scanning old history would just waste time,
-never produce a wrong answer. A missing or corrupt cursor file is treated
-as "start from 0" and the loop just re-scans -- never a hard failure.
+**`<purpose>` is `sc.SHARED_POLL_PURPOSE` ("poll") for BOTH Salt Ask Human
+and Salt Trigger/Listen (fixed 2026-09-22, was two separate purposes,
+`"ask_human"`/`"listen"`).** They must share one file, not "never share,"
+because salt-api keeps exactly ONE ack per agent
+(`users.agent_updates_acked_id`), not one per local purpose string: a poll
+with `after=X` moves the server's stored ack to `max(current_ack, X)`, and
+every subsequent poll -- from ANY caller, local file or not -- gets served
+from that resolved position. Two separate local cursor files used to
+imply two independent positions that don't actually exist server-side; if
+one component's poll advanced the real (shared) ack past rows the OTHER
+component's own, staler local file still expected to see, that request
+got silently resolved past them and never saw them at all -- not a
+"wastes time re-scanning" problem, a genuine missed-event bug. Sharing one
+file makes this package's own bookkeeping match the one true position the
+server already enforces.
+
+**This does NOT make it safe to run Salt Ask Human and Salt Trigger/Listen
+concurrently against the same agent_id** (nor two `Ask Human` calls
+concurrently, e.g. two parallel flow runs waiting on two different
+questions on the same agent). The underlying constraint is "one poller per
+agent" -- sharing the cursor file removes a MISLEADING appearance of
+independence, it does not add mutual exclusion. There is no lock here
+(a Langflow component has no natural place to hold one across concurrent
+flow executions); if your deployment genuinely needs concurrent socket-mode
+polling against one Salt agent, serialize it at the flow-orchestration
+level, not inside this package.
+
+This is otherwise a **performance optimization, not a correctness
+requirement** in the ordinary (single-poller) case: every poll loop still
+matches on something specific (a card_id, a requested event type), so
+re-scanning old history would just waste time, never produce a wrong
+answer. A missing or corrupt cursor file is treated as "start from 0" and
+the loop just re-scans -- never a hard failure.
 
 ## The keyless boundary, and why even Ask Human needs no private key
 
