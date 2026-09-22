@@ -1,9 +1,10 @@
 # saltapp-langflow
 
-Langflow custom components for [Salt](https://saltapp.ai): send an
-end-to-end encrypted chat message, ask a human a question and wait for
-the tap, request a payment, and poll for new Salt events -- all as
-drop-in nodes in a Langflow flow, built on the
+Langflow custom components for [Salt](https://saltapp.ai): send a chat
+message (encrypted, or plain in an open room), ask a human a question and
+check for the tap, request a payment, read a room's messages on demand,
+manage this agent's interests in a room, and check for new Salt events --
+all as drop-in nodes in a Langflow flow, built on the
 [`saltapp`](https://github.com/0000F8/saltapp-python) Python SDK.
 
 ## Install
@@ -40,7 +41,7 @@ is discovered; a further subfolder is not).
 
 This repo's `saltapp_langflow/` folder is already laid out as exactly one
 such category folder: it has an `__init__.py` that imports and re-exports
-the four component classes, and the component files sit directly inside
+the six component classes, and the component files sit directly inside
 it (no further nesting). So point Langflow's env var at this repo's root
 (the *parent* of `saltapp_langflow/`):
 
@@ -51,7 +52,7 @@ langflow run
 
 Langflow will show a category named **saltapp_langflow** (Langflow uses
 the folder's own name as the category label) in the component palette,
-containing the four components below. If you want a nicer label, rename
+containing the six components below. If you want a nicer label, rename
 or symlink the folder (e.g. `salt/`) before pointing
 `LANGFLOW_COMPONENTS_PATH` at its parent -- the folder name is the only
 thing that changes; nothing inside the files needs to change.
@@ -73,50 +74,67 @@ just add this repo's root as one more entry.
 
 ## Components
 
-Every component shares five credential/connection fields; the first three
-are always required, the last two are never used by anything in this
-package (see "Working keyless" below) but are kept on every component for
-a consistent field layout:
+Salt Send Message, Salt Ask Human, Salt Request Payment, and Salt Read
+Updates share five credential/connection fields; the first three are
+always required, the last two are never used by anything in this package
+(see "Working keyless" below) but are kept on those four components for a
+consistent field layout. Salt Read Room and Salt Interests, added in
+0.2.0's open-rooms support, deliberately do not carry `private_key`/
+`passphrase` at all -- see "Working keyless" below for why:
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `host` | text | yes | The Salt deployment, e.g. `https://saltapp.ai`. |
-| `agent_id` | text | yes* | This agent's own Salt id. Salt Send Message and Salt Ask Human/Listen use it to tell this agent's own row apart from everyone else's (Send Message: skip encrypting a copy to yourself as a "recipient"; Ask Human/Listen: namespace the local poll-cursor file). Salt Request Payment accepts it too for a consistent field set but never sends it to the API. |
-| `api_key` | secret | yes | This agent's Salt API key. |
-| `private_key` (Agent Private Key) | secret, multi-line | no | Not needed by anything in this package. |
-| `passphrase` (Private Key Passphrase) | secret | no | Not needed by anything in this package. |
+| `agent_id` | text | yes* | This agent's own Salt id. Salt Send Message and Salt Ask Human/Read Updates use it to tell this agent's own row apart from everyone else's (Send Message: skip encrypting a copy to yourself as a "recipient"; Ask Human/Read Updates: namespace the local check-cursor file). Salt Request Payment and Salt Interests accept it too for a consistent field set but never send it to the API. Salt Read Room has no `agent_id` field at all -- it never needs to tell itself apart from anyone. |
+| `api_key` | secret | yes** | This agent's Salt API key. **Optional on Salt Read Room only** -- see "Open rooms and Salt Read Room's anonymous read" below. |
+| `private_key` (Agent Private Key) | secret, multi-line | no | Not needed by anything in this package. Present only on Salt Send Message, Salt Ask Human, Salt Request Payment, Salt Read Updates. |
+| `passphrase` (Private Key Passphrase) | secret | no | Not needed by anything in this package. Present only on Salt Send Message, Salt Ask Human, Salt Request Payment, Salt Read Updates. |
 
 ### Salt Send Message
 
-Encrypts `text` for every other member of `chat_id` (fetched live from
-Salt) and posts it, plus a best-effort self-copy if this agent's own
-public key is among the chat's members.
+Posts `text` into `chat_id` -- plain text if the room is open
+(`encrypted: false`, saltapp 0.2.0), otherwise encrypted for every other
+member of the chat (fetched live from Salt), plus a best-effort self-copy
+if this agent's own public key is among the chat's members.
 
 - Inputs: `chat_id` (tool mode), `text` (tool mode), `quiet` (advanced,
   default off).
-- Output: `Result` (`Message`) -- a one-line confirmation; the sent-message
-  id is in the component's status line.
-- Raises if nobody else in the chat has a public key on file yet (nothing
-  would be encrypted for).
+- Output: `Result` (`Message`) -- a one-line confirmation; the status line
+  says whether it went out plain or encrypted, the sent-message id, and
+  (when the API returns it) why an open room actually delivered it
+  (`delivered_because`: mention, reply, keyword, or "all").
+- Raises if the room is encrypted and nobody else in the chat has a
+  public key on file yet (nothing would be encrypted for). An open room
+  never raises for this reason -- there is nothing to encrypt.
 
 ### Salt Ask Human
 
-Posts a card with button options into `chat_id` and waits, up to 50
-seconds, for a human to tap one. `tool_mode` is on for `chat_id`,
-`question`, and `options`, so an Agent component with a Tools input can
-call this directly as a tool.
+Posts a card with button options into `chat_id`, then checks **once** for
+a tap and always returns -- the answer if one is already there, or a
+pending result you re-check later. There is no waiting inside this
+component; see "Push vs. on-demand" below for why, and how to actually
+get an answer.
 
-- Inputs: `chat_id` (tool mode), `question` (tool mode), `options` (tool
-  mode, comma-separated labels, 1-5, default `"Yes,No"`), `wait_seconds`
-  (default and hard cap 50 -- a value above 50 is silently clamped).
-- Output: `Answer` (`Message`) -- the tapped option's label, or a plain
-  `"No answer within <n>s."` on timeout. The component never raises on a
-  timeout; a flow should not crash because a human did not tap in time.
-  Who answered and the raw tapped `action_id` are in the status line.
+- Inputs: `chat_id` (tool mode), `question` (tool mode, only used when
+  posting), `options` (tool mode, comma-separated labels, 1-5, default
+  `"Yes,No"`, only used when posting), `card_id` (tool mode, optional --
+  leave blank to post a new question; fill in a card_id from a previous
+  pending result to check that same card again without posting a new
+  one).
+- Output: `Answer` (`Message`) -- the tapped option's label if the
+  one-shot check found a tap (this covers the instant-tap case even on a
+  fresh post), or `"pending:<card_id>"` otherwise. **This is a breaking
+  behavior change**: earlier versions of this component blocked for up to
+  50 seconds (`wait_seconds`, now removed) before returning a
+  `"No answer within <n>s."` result. There is no more waiting -- a flow
+  or an Agent-driven LLM must re-invoke this component with `card_id` set
+  to the pending id whenever it wants to check again. Who answered and the
+  raw tapped `action_id` are in the status line.
 - A tap from another Salt **agent** is ignored -- only a human's tap
   resolves the ask.
 - Real API errors (bad api-key, unreachable host, and so on) still raise
-  normally; only "nobody tapped in time" is reported as a plain result.
+  normally; only "nobody tapped yet" is reported as a plain pending
+  result.
 
 ### Salt Request Payment
 
@@ -129,33 +147,90 @@ request bubble into `chat_id`.
 - Output: `Result` (`Data`) -- the raw API response (request id, status,
   and so on).
 
-### Salt Trigger/Listen
+### Salt Read Room
 
-Polls this agent's Salt updates for the next new event since the last
-call, instead of Langflow's own built-in `Webhook` component. See "Why not
-the built-in Webhook component" below for why.
+Reads a chat's session and messages **on demand** -- `GET
+/api/v1/chats/:id` (saltapp 0.2.0), optionally with a `last` cursor for a
+catch-up window instead of the ten most recent. Every returned message
+already carries `encrypted`/`delivered_because` verbatim from salt-api;
+this component passes them through as-is.
 
-- Inputs: `wait_seconds` (default 25, hard cap 55), `event_types`
-  (optional, comma-separated filter: `message`, `card_interaction`,
-  `invoice_paid`, `chat_opened`, `handoff_confirmed`, `handoff_received`;
-  blank means any of them).
-- Output: `Event` (`Data`) -- `{"status": "event", "event_type": ...,
-  "delivery_id": ..., "created_at": ..., "body": ...}` for the event
-  found, or `{"status": "no_new_events"}` if `wait_seconds` elapses first.
-- Persists a small poll-cursor file per agent so a later run does not
+- Inputs: `chat_id` (tool mode), `last` (optional -- a message `seq`
+  cursor; blank means the ten most recent messages).
+- Output: `Room` (`Data`) -- the raw `{"session": {...}, "messages":
+  [...]}` payload `get_chat` returns.
+- **Works fully keyless**: `api_key` is optional here (unlike every other
+  component in this package) -- see "Open rooms and Salt Read Room's
+  anonymous read" below.
+- Has no `agent_id`/`private_key`/`passphrase` fields at all -- see
+  "Working keyless" below.
+
+### Salt Interests
+
+Sets, reads, or clears this agent's follow settings for a chat (saltapp
+0.2.0's subscriptions): who gets notified of a new message in a room
+nobody @mentioned or replied to them in.
+
+- Inputs: `chat_id` (tool mode), `action` (tool mode, dropdown: `"set"`
+  default, `"get"`, `"clear"`), `mode` (tool mode, dropdown: `"addressed"`
+  -- today's unwritten default, mentions/replies only --, `"keywords"`,
+  `"all"`; required when `action="set"`), `keywords` (tool mode, optional
+  comma-separated list, only used when `mode="keywords"`).
+- Output: `Result` (`Data`) -- the raw API response for `"get"`/`"set"`,
+  or `{"status": "error", "error": "..."}` (never a raised exception) for
+  an invalid `action` or a missing `mode` when `action="set"`.
+- salt-api itself refuses this against an encrypted chat (422); this
+  component does not pre-check that, it relays whatever the server says.
+
+### Salt Read Updates
+
+*(was Salt Trigger/Listen -- renamed in this same pass, see "No polling,
+ever" below.)* Checks **once** for this agent's new Salt events (message,
+card tap, payment, chat opened, or hand-off) since the last check,
+instead of Langflow's own built-in `Webhook` component. See "Why not the
+built-in Webhook component" below for why.
+
+- Inputs: `event_types` (optional, comma-separated filter: `message`,
+  `card_interaction`, `invoice_paid`, `chat_opened`, `handoff_confirmed`,
+  `handoff_received`; blank means any of them).
+- Output: `Events` (`Data`) -- `{"status": "events", "events": [{
+  "event_type": ..., "delivery_id": ..., "created_at": ..., "body": ...
+  }, ...]}` for every matching event found in that one check (not just
+  the first), or `{"status": "no_new_events", "events": []}` if none
+  were. **This is a breaking behavior change**: earlier versions of this
+  component (as Salt Trigger/Listen) polled for up to `wait_seconds`
+  (default 25, hard cap 55, now removed) before giving up, and returned
+  at most one event. There is no more waiting, and multiple events in the
+  same check are no longer dropped.
+- Persists a small check-cursor file per agent so a later run does not
   re-deliver an event an earlier run already returned (see AGENTS.md,
-  "The ask/poll and listen-poll designs").
+  "The ask/check design").
 - Meant to sit at the start of a flow that is itself triggered on its own
   schedule, cron, or manual run, and pick up whatever is new since last
-  time -- not to hold one HTTP request open for a long time.
-- **Shares its poll cursor with Salt Ask Human, and shares its underlying
-  "one ack per agent" with anything else polling this same Salt agent
-  (salt-api keeps a single stored position per agent, not one per caller).
-  Don't run Salt Ask Human and Salt Trigger/Listen concurrently against
-  the same agent, and don't run two Ask Human calls concurrently on it
-  either** -- see AGENTS.md's "File-based cursor state" for what actually
-  goes wrong (a missed event, not just wasted work) and why this package
-  has no way to enforce it for you.
+  time.
+- **Shares its check cursor with Salt Ask Human, and shares its
+  underlying "one ack per agent" with anything else checking this same
+  Salt agent (salt-api keeps a single stored position per agent, not one
+  per caller). Don't run Salt Ask Human and Salt Read Updates
+  concurrently against the same agent, and don't run two Ask Human calls
+  concurrently on it either** -- see AGENTS.md's "File-based cursor
+  state" for what actually goes wrong (a missed event, not just wasted
+  work) and why this package has no way to enforce it for you.
+
+### Open rooms and Salt Read Room's anonymous read
+
+saltapp 0.2.0 adds "open rooms": a chat with `session.encrypted == false`
+carries plain text, not PGP ciphertext, and -- if it is also `public` --
+can be read with **no Salt identity at all**. Salt Read Room's `api_key`
+field is optional specifically to reach that path: leave it blank and
+this component sends no api-key header whatsoever, which salt-api
+answers for a `public && !encrypted` room exactly as it would for an
+authenticated read (same session + messages shape). Anything else with a
+blank key -- a private room, an encrypted room, or a room that does not
+exist -- still 404s, indistinguishably from a genuine not-found. Salt
+Send Message, when it posts into an open room, uses the SAME
+`session.encrypted` flag to decide plain vs. encrypted delivery
+automatically; you don't tell it which to use.
 
 ## Working keyless
 
@@ -163,20 +238,29 @@ Every component in this package runs **without** `private_key`/
 `passphrase` set at all:
 
 - **Salt Send Message** only needs recipients' *public* keys to encrypt a
-  message for them -- fetched live from the chat's member list. Sending
-  never needs this agent's own private key.
-- **Salt Ask Human** and **Salt Trigger/Listen** only ever read plain
+  message for them -- fetched live from the chat's member list -- or, in
+  an open room, no keys at all. Sending never needs this agent's own
+  private key.
+- **Salt Ask Human** and **Salt Read Updates** only ever read plain
   structured data: a button tap, a payment confirmation, a chat-opened
   notice. None of these arrive as PGP ciphertext, so there is nothing to
   decrypt -- a tapped button is never encrypted, even in a chat where
   every message is.
 - **Salt Request Payment** posts a plain structured API record; no
   encryption is involved on either side.
+- **Salt Read Room** returns a chat's raw messages exactly as sent
+  (ciphertext included, for an encrypted room) and never decrypts
+  anything, and **Salt Interests** never touches message content at all
+  -- a subscription is a plain per-agent setting.
 
-`private_key`/`passphrase` are kept as optional fields on every component
-purely for a consistent field layout across this package (and in case a
-future component needs to read encrypted message text -- none of the four
-here do).
+`private_key`/`passphrase` are kept as optional fields on Salt Send
+Message, Salt Ask Human, Salt Request Payment, and Salt Read Updates
+purely for a consistent field layout across those four (and in case a
+future component needs to read encrypted message text -- none of these
+four do either). Salt Read Room and Salt Interests, added alongside open
+rooms, skip the fields entirely: neither has a plausible future need for
+them, so there is no present-but-unused field worth keeping for
+consistency's sake (see AGENTS.md, "The keyless boundary").
 
 ## Why not the built-in Webhook component
 
@@ -199,34 +283,88 @@ webhook callback straight at a Langflow flow's `/api/v1/webhook/<flow_id>`
 endpoint would mean trusting unverified, unauthenticated input that merely
 *claims* to be from Salt. We are not willing to ship that.
 
-**Salt Trigger/Listen** exists instead: it pulls from Salt's own
-`GET /api/v1/agent/updates` socket-mode endpoint (the same one
-`saltapp.socket.SocketClient` and Salt Ask Human's poll both use),
-verifying each row's signature itself before it is ever returned. This is
-also consistent with Langflow's own synchronous, run-to-completion
-component-execution model: a flow run is not a persistent daemon by
-default (unlike `saltapp.agent.Agent.run_socket()`), so both Ask Human and
-Listen are built the same way -- as a bounded poll, not a long-lived
-listener.
+**Salt Read Updates** exists instead: it checks Salt's own
+`GET /api/v1/agent/updates` socket-mode endpoint (the same one Salt Ask
+Human's one-shot check also uses), verifying each row's signature itself
+before it is ever returned. This is also consistent with Langflow's own
+synchronous, run-to-completion component-execution model: a flow run is
+not a persistent daemon by default (unlike
+`saltapp.agent.Agent.run_socket()`), so both Ask Human and Read Updates
+are built the same way -- a single on-demand check, not a long-lived
+listener, and (as of this package's 2026-09-22 rewrite) not even a
+bounded poll loop. See "No polling, ever" below.
+
+## No polling, ever
+
+This package has one hard rule, from the product owner: **Langflow
+components are stateless calls, and must never loop or sleep waiting for
+something to happen.** Every earlier version of this package's Salt Ask
+Human and Salt Trigger/Listen (now Salt Read Updates) DID loop -- a
+bounded short-poll, sleeping between rounds for up to `wait_seconds`.
+That loop is gone. `_salt_common.check_for_event` now makes exactly ONE
+`GET /api/v1/agent/updates` call per component invocation (the
+`timeout=2` it sends is the server's own short grace window for that one
+request, not a client-side retry budget) and returns immediately with
+whatever it finds -- see AGENTS.md's "The ask/check design" for the full
+mechanics. This is a real, breaking behavior change to both components'
+public API: see their sections above ("This is a breaking behavior
+change").
+
+## Push vs. on-demand
+
+Genuine push -- "notify me the moment something happens, with no polling
+and no re-checking" -- needs something that can hold a persistent
+connection open (a webhook receiver, or a real-time socket). **Langflow
+has no mechanism for a custom component to register an HTTP endpoint or
+run a persistent process**: a component's build method runs once per flow
+invocation and returns, full stop. So genuine push cannot be built INSIDE
+this package, at all, ever -- it needs pairing with something else that
+CAN hold a persistent receiver:
+
+- **`saltapp.agent.Agent`** (or `saltapp.integrations.create_asgi_app`)
+  run as their own small always-on process.
+- **`salt-claude-agent`**, if your setup already runs one.
+- **`n8n-nodes-saltapp`'s `Salt Trigger` node**, if your setup already
+  runs n8n -- n8n's own workflow engine holds the persistent connection,
+  not a Langflow component.
+
+Whichever of those receives the push still needs its own way to actually
+start a Langflow flow run (Langflow's own API/webhook-triggered flow
+execution) -- that wiring is outside this package's scope; we are not
+attempting to build a persistent receiver inside `saltapp-langflow`
+itself, because that would contradict the stateless-call architecture
+described above.
+
+**This package's components remain the correct ON-DEMAND-READ half of
+that pairing, not a replacement for the push half.** Salt Read Room,
+Salt Read Updates, and Salt Ask Human's re-check path are all "read
+what's new since a cursor, right now, because I was just invoked" --
+call them again whenever your flow (or the LLM driving it) next wants to
+check.
 
 ## A worked example flow
 
 **"Ask before you spend"**: an Agent component with `saltapp-langflow`'s
 Salt Send Message, Salt Ask Human, and Salt Request Payment wired in as
-tools (Agent's Tools input accepts any component with a `tool_mode` input).
-The LLM decides, from the conversation, that a purchase needs approval:
-it calls Salt Ask Human with `question="Approve this $12 purchase?"` and
-`options="Approve,Decline"`; a human in the chat taps a button within 50
-seconds; the tool call returns `"Approve"` or `"Decline"` (or a timeout
-message) straight into the agent's context, and the agent's next turn
-calls Salt Request Payment (on approval) or Salt Send Message (on
-decline) accordingly. No separate inbox, no polling loop in your flow's
-own logic -- the wait is inside the tool call.
+tools (Agent's Tools input accepts any component with a `tool_mode`
+input). The LLM decides, from the conversation, that a purchase needs
+approval: it calls Salt Ask Human with `question="Approve this $12
+purchase?"` and `options="Approve,Decline"`. If a human happens to tap
+within that one check, the tool call returns `"Approve"` or `"Decline"`
+straight into the agent's context and the agent's next turn calls Salt
+Request Payment (on approval) or Salt Send Message (on decline)
+accordingly. Otherwise it returns `"pending:<card_id>"`; the LLM (or your
+flow's own retry logic) re-invokes Salt Ask Human later with that
+`card_id` to check again -- there is no waiting inside the tool call
+itself.
 
-A second, separate flow can use **Salt Trigger/Listen** at its start,
+A second, separate flow can use **Salt Read Updates** at its start,
 triggered on a schedule (Langflow's own run scheduling, or an external
 cron hitting the Langflow API), to pick up whatever happened on Salt since
-its last run -- new messages, taps, payments -- and act on it.
+its last run -- new messages, taps, payments -- and act on it. A third
+flow can use **Salt Read Room** the same way against a public open room
+with no `api_key` at all, to summarize what was said since the last
+`last` cursor it saw.
 
 ## Development
 
@@ -236,7 +374,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-See `AGENTS.md` for the design notes behind the poll-based Ask Human/
-Listen components, and `HANDOFF.md` for what was tested, how to run a
-manual UAT pass against a real `saltapp.ai` account, and what is left
+See `AGENTS.md` for the design notes behind the check-based Ask Human/
+Read Updates components, and `HANDOFF.md` for what was tested, how to run
+a manual UAT pass against a real `saltapp.ai` account, and what is left
 undone.

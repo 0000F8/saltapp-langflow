@@ -1,4 +1,4 @@
-"""_salt_common.poll_for_event's signature-verification tolerance.
+"""_salt_common.check_for_event's signature-verification tolerance.
 
 Round-3/4 socket contract (LANES.md K2, "fix A" -- serve-time signing):
 salt-api re-signs every outbox row fresh at the moment it's actually served,
@@ -20,7 +20,7 @@ def test_poll_signature_tolerance_default_is_the_standard_300s_not_the_wide_sock
     assert sc.POLL_SIGNATURE_TOLERANCE_SECONDS == 300
 
 
-def test_poll_for_event_accepts_a_row_signed_moments_ago(tmp_path):
+def test_check_for_event_accepts_a_row_signed_moments_ago(tmp_path):
     client = FakeSaltClient()
     body = {"message": {"id": "msg-1"}, "chat_id": "chat-1"}
     headers, raw = sign_body(body, timestamp=int(time.time()))
@@ -29,15 +29,15 @@ def test_poll_for_event_accepts_a_row_signed_moments_ago(tmp_path):
     client.update_rounds = [{"updates": [row], "cursor": 1}]
 
     cursor = sc.PersistentCursor(tmp_path / "cursor.json")
-    event = sc.poll_for_event(
-        client, "sk-test", secret=WEBHOOK_SECRET, cursor=cursor, wait_seconds=0, predicate=lambda e: True,
+    matches, _new_cursor = sc.check_for_event(
+        client, "sk-test", secret=WEBHOOK_SECRET, cursor=cursor, predicate=lambda e: True,
     )
 
-    assert event is not None
-    assert event.body == body
+    assert len(matches) == 1
+    assert matches[0].body == body
 
 
-def test_poll_for_event_rejects_a_row_signed_a_day_ago_now_that_the_tolerance_is_standard(tmp_path):
+def test_check_for_event_rejects_a_row_signed_a_day_ago_now_that_the_tolerance_is_standard(tmp_path):
     """This exact row would have PASSED under the old, still-wide
     saltapp.socket.SOCKET_SIGNATURE_TOLERANCE_SECONDS (7 days + 1h) -- this
     test is what proves this package no longer uses that value."""
@@ -50,15 +50,15 @@ def test_poll_for_event_rejects_a_row_signed_a_day_ago_now_that_the_tolerance_is
     client.update_rounds = [{"updates": [row], "cursor": 1}]
 
     cursor = sc.PersistentCursor(tmp_path / "cursor.json")
-    event = sc.poll_for_event(
-        client, "sk-test", secret=WEBHOOK_SECRET, cursor=cursor, wait_seconds=0, predicate=lambda e: True,
+    matches, _new_cursor = sc.check_for_event(
+        client, "sk-test", secret=WEBHOOK_SECRET, cursor=cursor, predicate=lambda e: True,
     )
 
-    assert event is None  # rejected as unverifiable at the standard tolerance, not matched
-    assert cursor.get() == 1  # still advances past the bad row -- see poll_for_event's own docstring
+    assert matches == []  # rejected as unverifiable at the standard tolerance, not matched
+    assert cursor.get() == 1  # still advances past the bad row -- see check_for_event's own docstring
 
 
-def test_poll_for_event_honors_an_explicit_tolerance_override():
+def test_check_for_event_honors_an_explicit_tolerance_override():
     """A caller CAN still pass a wider tolerance explicitly -- the fix is
     to the default, not to removing the parameter."""
     client = FakeSaltClient()
@@ -70,14 +70,13 @@ def test_poll_for_event_honors_an_explicit_tolerance_override():
     client.update_rounds = [{"updates": [row], "cursor": 1}]
 
     cursor = sc.PersistentCursor(sc.state_dir("agent-self", "test-tolerance-override") / "cursor.json")
-    event = sc.poll_for_event(
+    matches, _new_cursor = sc.check_for_event(
         client,
         "sk-test",
         secret=WEBHOOK_SECRET,
         cursor=cursor,
-        wait_seconds=0,
         predicate=lambda e: True,
         tolerance_seconds=7 * 24 * 60 * 60,
     )
 
-    assert event is not None
+    assert len(matches) == 1

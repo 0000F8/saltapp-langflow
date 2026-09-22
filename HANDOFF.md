@@ -1,5 +1,167 @@
 # HANDOFF.md
 
+## 2026-09-22 open rooms, no-polling rewrite (`lane/open-rooms`)
+
+Branch `lane/open-rooms`, built against the sibling `saltapp-python`
+checkout's own `lane/open-rooms` branch (saltapp 0.2.0, installed here via
+`.venv/bin/pip install -e /path/to/saltapp-python` -- see `pyproject.toml`'s
+updated dependency comment for why the git URL itself is untouched). Two
+independent things landed in the same pass because the task bundled them:
+saltapp 0.2.0's **open rooms**/**interests** support, and the owner's
+separate, unrelated **"no polling, ever"** rule for this package's
+event-checking components. Real end-to-end test count: **20 -> 32
+passing** (`.venv/bin/python -m pytest -q` from the repo root):
+
+```
+32 passed, 22 warnings in 0.90s
+```
+
+(warnings are the same pre-existing third-party deprecation noise the
+2026-09-22 alignment-pass entry below already documented -- pgpy/
+cryptography/pydantic, nothing from this package's own code.)
+
+### What changed
+
+- **`pyproject.toml`**: documented saltapp's effective `>=0.2.0` floor in
+  a comment (PEP 508 forbids combining a version specifier with the
+  existing direct-URL dependency, so the git URL line itself is
+  unchanged) and pointed local dev at the sibling editable checkout until
+  saltapp-python's `lane/open-rooms` merges to its own `main`. Also
+  refreshed the package `description` (it still said "poll for new Salt
+  events").
+- **`saltapp_langflow/_salt_common.py`**:
+  - New `send_message()` -- reads a chat's `session.encrypted` flag and
+    dispatches to `client.post_plain_message` (open room) or the
+    (renamed-in-place) `send_encrypted_message()` (everything else).
+    `send_encrypted_message()` gained an optional `members` parameter so
+    `send_message()` can pass along the member list it already fetched
+    via `get_chat` instead of paying for a second `get_chat_members`
+    round trip -- it still defaults to fetching fresh, so any other
+    caller is unaffected.
+  - New `read_room()` -- thin wrapper over `client.get_chat`, `api_key`
+    defaults to `""` so a falsy field value reaches `SaltClient` as "no
+    api-key header at all" (the anonymous-open-room path).
+  - `poll_for_event()` deleted; replaced by `check_for_event()` -- same
+    per-row verify/advance-cursor logic, but ONE `get_agent_updates` call,
+    no `wait_seconds`, no `time.sleep`, no loop, and it returns
+    `(matches: list[Event], new_cursor: int)` instead of stopping at the
+    first predicate hit.
+  - `_POLL_SLEEP_SECONDS` deleted (nothing sleeps anymore); `import time`
+    removed (nothing left that needs it).
+- **`saltapp_langflow/send_message.py`**: calls `sc.send_message()`
+  instead of `sc.send_encrypted_message()`; status line now says plain vs.
+  encrypted and echoes `delivered_because` when the API returns it.
+- **`saltapp_langflow/read_room.py`** (new): `SaltReadRoomComponent`.
+  `api_key` is `required=False` and the ONLY field in this package that
+  is genuinely optional at runtime, not just conventionally present; no
+  `agent_id`/`private_key`/`passphrase` fields at all.
+- **`saltapp_langflow/interests.py`** (new): `SaltInterestsComponent`,
+  `action` (dropdown: set/get/clear) + `mode` (dropdown: addressed/
+  keywords/all, required only when `action="set"`, validated in code
+  since a Langflow input's `required` flag can't depend on another
+  field's value) + `keywords`. Invalid input returns
+  `{"status": "error", ...}`, never raises.
+- **`saltapp_langflow/ask_human.py`**: `wait_seconds`/`MAX_WAIT_SECONDS`
+  removed. New `card_id` input: blank posts a new card (as before) and
+  the same one `check_for_event` call now also covers the instant-tap
+  case; non-blank skips posting and re-checks that card. Either way it
+  ALWAYS returns -- the answer, or `Message(text=f"pending:{card_id}")`.
+- **`saltapp_langflow/read_updates.py`** (new, replaces `listen.py`,
+  deleted): `SaltReadUpdatesComponent`. `wait_seconds`/
+  `MAX_WAIT_SECONDS`/`DEFAULT_WAIT_SECONDS` removed. One
+  `check_for_event` call, returns EVERY matching event from that one
+  response page (`{"status": "events", "events": [...]}`), not just the
+  first.
+- **`saltapp_langflow/__init__.py`**: `SaltListenComponent`/`listen`
+  dropped; `SaltReadUpdatesComponent`/`read_updates`,
+  `SaltReadRoomComponent`/`read_room`, `SaltInterestsComponent`/
+  `interests` added.
+- **Tests**: `tests/conftest.py`'s `FakeSaltClient` gained `get_chat`,
+  `post_plain_message`, `get_chat_subscription`/`set_chat_subscription`/
+  `clear_chat_subscription`, all following the existing `_record`/
+  `..._response` attribute pattern. The `_no_real_sleep` fixture was
+  deleted (grepped first -- nothing calls `time.sleep` anymore).
+  `tests/test_listen.py` deleted; `tests/test_read_updates.py`,
+  `tests/test_read_room.py`, `tests/test_interests.py` added.
+  `tests/test_ask_human.py` rewritten for the card_id/one-shot semantics,
+  asserting exact `get_agent_updates` call counts (proving there is no
+  loop, not just checking outcomes) alongside the answer/pending
+  outcomes. `tests/test_send_message.py` gained the open-room case (with
+  a `crypto.encrypt_for` spy proving the PGP path is untouched) and a
+  case for the `session["users"]`-missing fallback; its existing
+  encrypted-room test now sources members from `get_chat_response`'s
+  `session.users` instead of the old standalone
+  `chat_members_response` (both fields still exist on the fake; the
+  fallback test is what actually exercises the old one now).
+  `tests/test_shared_cursor.py`/`tests/test_signature_tolerance.py`
+  updated for the `check_for_event` rename and its new
+  `(matches, cursor)` return shape; the behavior they pin (cursor
+  advance, signature tolerance) is unchanged.
+- **Docs**: `README.md` and `AGENTS.md` rewritten in the affected
+  sections (component list, the ask/check design, keyless boundary,
+  file-based cursor state, known limitations) rather than appended to --
+  per the task's instruction for AGENTS.md, and because leaving the old
+  poll-loop prose next to the new one-shot design would have been
+  actively misleading. Two new README sections, "No polling, ever" and
+  "Push vs. on-demand", name `n8n-nodes-saltapp`'s `Salt Trigger` node
+  and `saltapp.agent.Agent`/`create_asgi_app` as the concrete
+  push-pairing options and are explicit that this package cannot host a
+  webhook receiver itself.
+
+### Deviations from the spec, and why
+
+- **`check_for_event` no longer catches or retries a transport error from
+  `get_agent_updates`.** The old `poll_for_event` caught a
+  non-`SaltApiError` exception (a network hiccup) and retried it within
+  the remaining `wait_seconds` budget, re-raising only a real
+  `SaltApiError` immediately. With the loop gone there is no "remaining
+  budget" to retry within, so `check_for_event` now makes its one call
+  with no try/except at all -- ANY exception (`SaltApiError` or a bare
+  transport error) propagates straight to the caller. This was not
+  spelled out explicitly in the task brief, which only said "does exactly
+  ONE `client.get_agent_updates(...)` call" with the existing verify-each-
+  row/advance-cursor reasoning kept; letting every exception surface
+  (never silently swallowing a hiccup into a false "no events") seemed
+  the more defensible reading of "no loop, no retry" than inventing a new
+  one-shot suppression rule with no round to retry in.
+- **Kept a couple of small, cheap extra tests beyond the letter of the
+  spec**: a fallback test for `send_message()`'s `session["users"]`-
+  missing path (the real SDK's response always has that key today, so
+  this path is otherwise dead code with no coverage), and a `mode`
+  DropdownInput non-"keywords" case for Salt Interests asserting
+  `keywords=None` reaches the API. Both are single test functions
+  following the existing file's own pattern; neither broadens the
+  production code.
+- **`ask_human.py`'s re-check path still computes `label_by_action` from
+  whatever `self.options` currently holds**, even on a re-check call
+  (rather than only on a fresh post). The spec didn't say either way. If
+  a caller re-supplies the same `options` on the re-check call (an Agent
+  tool call can do this naturally), the returned answer is still the
+  human-readable label instead of a raw `action_id`; if not, it falls
+  back to the raw `action_id`, exactly as an empty-mapping re-check would
+  have either way. This costs nothing (no extra API call) and never
+  fails, so it was kept rather than special-cased away.
+- **`AGENTS.md`'s "Known limitations" section had a pre-existing stale
+  claim** ("Ask Human and Listen use different `<purpose>` values") left
+  over from BEFORE that same file's own earlier 2026-09-22 entry (below)
+  actually unified them onto `SHARED_POLL_PURPOSE`. Fixed while rewriting
+  the surrounding paragraph for the Read Updates rename, since leaving a
+  now-doubly-wrong sentence next to a passage this pass was already
+  rewriting would have been worse than the small scope tick.
+
+### What was NOT done / out of scope, per the task
+
+- No live end-to-end run against a real `salt-api` with the new open-room
+  endpoints -- same limitation as every earlier pass (`FakeSaltClient`
+  only, no `httpx`), see "Known limitations" in AGENTS.md and the UAT
+  steps below.
+- No attempt at a persistent webhook receiver inside this package --
+  explicitly out of scope per the task brief and per this repo's own
+  established "components run once per invocation" architecture; the
+  README's new "Push vs. on-demand" section documents the pairing instead.
+- Not pushed, no PR opened, no other repo touched, per the task's
+  instructions.
+
 ## 2026-09-22 alignment pass (round-4 socket contract)
 
 - **Fixed a real round-3/4 contract violation**: `_salt_common.py` used to
