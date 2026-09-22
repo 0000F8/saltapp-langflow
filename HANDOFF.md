@@ -1,5 +1,38 @@
 # HANDOFF.md
 
+## 2026-09-22 alignment pass (round-4 socket contract)
+
+- **Fixed a real round-3/4 contract violation**: `_salt_common.py` used to
+  import and default to `saltapp.socket.SOCKET_SIGNATURE_TOLERANCE_SECONDS`
+  (still the pre-round-4 widened value, 7 days + 1h, as of this pass). Per
+  LANES.md's "fix A" (serve-time signing), salt-api now re-signs every
+  outbox row fresh at the moment it's actually served, so a row that sat
+  unpolled for the full 7-day retention window verifies with a signature
+  timestamped as if written just now -- the standard ~300s tolerance is
+  correct and sufficient, and the wide one is a real weakness (accepts a
+  signature far older than any genuine serve-time one could be). Replaced
+  with a local `POLL_SIGNATURE_TOLERANCE_SECONDS = 300`, defined rather
+  than imported so this package doesn't inherit the upstream bug; a caller
+  can still pass `tolerance_seconds` explicitly to override it. 4 new
+  tests in `tests/test_signature_tolerance.py`, including one that proves
+  a day-old-signed row (which the OLD default would have accepted) is now
+  correctly rejected.
+- **This package's own poll loop (`poll_for_event`) was already correctly
+  aligned otherwise**: 2s round timeout ("clamped there to 0..2s
+  regardless of what is sent"), 1s between rounds, a real cursor
+  (`PersistentCursor`) persisted to disk across component runs. NOT fixed
+  (out of this repo's scope): `saltapp.client.SaltClient.get_agent_updates`
+  (in the separate `saltapp-python` package this depends on via git)
+  always sends `after=<cursor>` literally, including `after=0` on a fresh
+  cursor, instead of omitting it so salt-api's server-side ack applies.
+  Flagged to the coordinator; not this repo's file to fix.
+- No brand-icon fix here: Langflow components reference a bundled Lucide
+  icon by name (`icon = "radio"`, `"send"`, etc.), not a custom SVG asset
+  slot -- there's nothing hand-drawn to replace.
+- 13 -> 17 tests passing.
+
+---
+
 ## What changed
 
 Brand-new repo. Built from scratch:

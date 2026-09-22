@@ -20,7 +20,6 @@ from typing import Any, Callable
 from saltapp import cards, crypto
 from saltapp.client import SaltClient
 from saltapp.errors import SaltApiError
-from saltapp.socket import SOCKET_SIGNATURE_TOLERANCE_SECONDS
 from saltapp.webhook import Event, WebhookVerificationError
 from saltapp.webhook import handle as handle_webhook
 
@@ -43,6 +42,20 @@ KEYLESS_INFO = (
 # 0..2s regardless of what is sent -- see SaltClient.get_agent_updates).
 _POLL_TIMEOUT_SECONDS = 2
 _POLL_SLEEP_SECONDS = 1.0
+
+# Deliberately NOT `saltapp.socket.SOCKET_SIGNATURE_TOLERANCE_SECONDS`: that
+# constant is still the pre-round-4 widened value (7 days + 1h) as of this
+# writing (see saltapp-python's own pending fix). LANES.md's round-3/4
+# socket contract, "fix A" (serve-time signing): salt-api now re-signs
+# every outbox row FRESH, over the stored body, at the moment it's actually
+# served by GET /api/v1/agent/updates -- never once at enqueue time. So a
+# row that sat unpolled for the full 7-day retention window verifies with a
+# signature timestamped as if written just now, and the STANDARD ~300s
+# tolerance (matching the webhook path) is correct and sufficient here too.
+# The wider tolerance is a real weakness now: it would accept a signature
+# far older than any genuine serve-time one could be. Defined locally
+# rather than imported so this package doesn't inherit that upstream bug.
+POLL_SIGNATURE_TOLERANCE_SECONDS = 300
 
 # who_am_i answers are cached per api-key for the life of this process --
 # cheap to skip re-fetching on every component run, and safe to keep stale
@@ -190,14 +203,14 @@ def poll_for_event(
     wait_seconds: float,
     predicate: Callable[[Event], bool],
     sleep_seconds: float = _POLL_SLEEP_SECONDS,
-    tolerance_seconds: int = SOCKET_SIGNATURE_TOLERANCE_SECONDS,
+    tolerance_seconds: int = POLL_SIGNATURE_TOLERANCE_SECONDS,
 ) -> Event | None:
     """Short-poll `GET /api/v1/agent/updates` (the same K2 socket-mode
     contract `saltapp.socket.SocketClient` uses) for up to `wait_seconds`,
-    verifying each row's signature at the wide socket-mode tolerance (an
-    outbox row can sit unpolled for days -- see
-    SOCKET_SIGNATURE_TOLERANCE_SECONDS), and returns the first `Event` for
-    which `predicate(event)` is true, or None if `wait_seconds` elapses
+    verifying each row's signature at the standard tolerance (see
+    POLL_SIGNATURE_TOLERANCE_SECONDS's own comment for why this is NOT the
+    wider one `saltapp.socket` still uses), and returns the first `Event`
+    for which `predicate(event)` is true, or None if `wait_seconds` elapses
     first.
 
     The cursor advances past every row seen in every round -- including
