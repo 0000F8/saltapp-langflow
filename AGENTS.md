@@ -52,7 +52,7 @@ should be the one supplying it. This mirrors how the Dify plugin's tools
 are shaped, and how `saltapp.client.SaltClient`'s own methods are shaped
 (every method takes the ids it needs, not an ambient "current" anything).
 
-## The ask/check design (rewritten 2026-09-22 -- no polling, ever)
+## The ask/check design (2026-09-22 no-polling rewrite; Ask Human moved off the shared outbox 2026-09-26)
 
 **The owner's explicit rule, via the task coordinator: "DO NOT USE
 POLLING as a mechanic EVER. Langflow components are stateless calls: they
@@ -65,7 +65,18 @@ component that needs to know "did anything happen" does exactly ONE
 on-demand check per invocation and returns immediately -- never a loop,
 never a `time.sleep`, never a wait budget of any kind.
 
-`_salt_common.check_for_event` is that one check:
+Two independent checks live in this package now, reading two different
+endpoints, for two different reasons:
+
+- **Salt Read Updates** still uses `_salt_common.check_for_event`
+  (unchanged by the 2026-09-26 pass), which reads this agent's shared
+  socket-mode outbox (`GET /api/v1/agent/updates`) -- see below.
+- **Salt Ask Human** (rewritten 2026-09-26) reads the ONE card it itself
+  posted (`GET /api/v1/cards/:id`, via `_salt_common.get_card`) instead.
+  See "Salt Ask Human reads its own card, not the shared outbox" further
+  down for why this changed and how it works now.
+
+`_salt_common.check_for_event` is Salt Read Updates' one check:
 
 1. Call `GET /api/v1/agent/updates?after=<cursor>&timeout=2` (the K2
    socket-mode contract) -- ONE HTTP request. `timeout=2` here is the
@@ -92,17 +103,18 @@ unverifiable row as fatal would just make the NEXT call fail outright
 after any one bad row, instead of skipping past it once, as before.
 
 **Salt Ask Human** posts a card (unless `card_id` is already given, in
-which case it skips posting -- a re-check call) and then runs exactly one
-`check_for_event`, predicate: a `card_interaction` whose `card_id`
-matches, tapped by a non-agent user. Either way it ALWAYS returns: the
-answer if the one-shot check found it (covers the instant-tap case), or a
-pending result (`Message(text=f"pending:{card_id}")`) otherwise. There is
-no more `wait_seconds` -- "wait for the answer" is now the CALLER's job:
+which case it skips posting -- a re-check call) and then makes exactly
+one check for a tap. Either way it ALWAYS returns: the answer if the
+one-shot check found it (covers the instant-tap case), or a pending
+result (`Message(text=f"pending:{card_id}")`) otherwise. There is no more
+`wait_seconds` -- "wait for the answer" is now the CALLER's job:
 re-invoke this same component with `card_id` set to what the pending
 result returned, whenever it next wants to check. An Agent-driven flow
 does this naturally (the LLM sees `"pending:<id>"`, and can be prompted
 to call the tool again later with that id); a scheduled/cron flow does it
-by construction (its next scheduled run passes the same `card_id`).
+by construction (its next scheduled run passes the same `card_id`). What
+that one check actually reads changed on 2026-09-26 -- see the next
+section.
 
 **Salt Read Updates** (was Salt Trigger/Listen) runs exactly one
 `check_for_event` with a predicate matching the caller's optional
@@ -111,6 +123,81 @@ returns every matching event from that one response page as a list --
 also unlike the old design, which returned at most one event and made
 the caller re-run the whole component just to see if there was a second
 one already sitting in the same page.
+
+## Salt Ask Human reads its own card, not the shared outbox (2026-09-26)
+
+Until 2026-09-26, Salt Ask Human's one check was ALSO a `check_for_event`
+call against the shared socket-mode outbox, sharing its cursor file with
+Salt Read Updates (see the git history of this section, and
+`test_shared_cursor.py`, now deleted, which used to document exactly this
+sharing). That outbox keeps exactly ONE forward-only `agent_updates_
+acked_id` per agent, server-side, not one per caller or purpose: a check
+with `after=X` moves the server's stored ack to `max(current_ack, X)`
+regardless of who sent it, and the server then serves everyone from that
+resolved position. Two independent problems fell out of this for Ask
+Human specifically, confirmed against the same production facts salt-mcp
+and saltapp-agentkit's own 2026-09-26 fixes were built on
+(`design-fleet/runs/2026-09-17-distribution/FOLLOWUPS.md`):
+
+1. **Two concurrent Ask Human calls against the same agent could consume
+   each other's answers.** A Langflow flow can genuinely run more than
+   one Agent-driven tool call concurrently (parallel tool calls in one
+   LLM turn, or two separate flow runs); each Ask Human call posts its
+   own distinct card, but both were reading the SAME shared cursor to
+   check for a tap. Whichever checked first could advance the ack past a
+   tap meant for the OTHER card, and that tap was then gone for good --
+   not a performance problem, a genuine missed answer.
+2. **An Ask Human check running beside a Salt Read Updates check on the
+   same agent had the identical problem in the other direction.**
+
+The fix: Salt Ask Human now reads the TAPPED CARD's own interaction log
+instead (`GET /api/v1/cards/:id`, `_salt_common.get_card`, owner-only,
+`interactions` newest-first, capped at 50 server-side). This is scoped to
+one card and idempotent -- reading it never advances any shared position,
+because there isn't one; any number of concurrent Ask Human calls, for
+this agent or any other, can each resolve their own ask independently by
+reading their own card. This mirrors salt-mcp's `pollForCardInteraction`/
+`getCard` and saltapp-agentkit's Python `_get_card`/`poll_for_answer` --
+see HANDOFF.md's 2026-09-26 entry for the full cross-reference.
+
+Three consequences worth knowing if you touch `ask_human.py`:
+
+- **No signature to verify.** The outbox's rows are signed deliveries
+  (`X-Salt-Signature`, verified by `check_for_event` via
+  `saltapp.webhook.handle`) because a webhook/socket delivery is
+  push-shaped and needs to prove it really came from Salt. A card read is
+  an ordinary authenticated REST call (api-key header, same trust model
+  as `get_chat`/`post_card`), so there is nothing to verify here at all --
+  `agent_id`/`resolve_identity`/`webhook_secret` are gone from this
+  component entirely, along with the "no webhook secret" early return.
+- **No account_type on a card interaction.** `CardInteraction#
+  as_json_for_owner` (salt-api) is `{id, user_id, action_id, value,
+  created_at}` -- unlike the old outbox event body, it never carries a
+  full `user` object, so there is no `account_type` or `username` to read
+  off the tap directly. Distinguishing a human's tap from another agent's
+  (the one behavior this component has always guaranteed) now means
+  fetching the chat's member list (`client.get_chat_members`) and
+  cross-referencing the tapper's `user_id` against it -- fetched fresh on
+  every check, and ONLY when there is at least one interaction to
+  classify (skipped entirely on the common "nothing tapped yet" case, to
+  avoid paying for it up front). A tapper no longer in the chat's member
+  list is treated the same as an agent's tap: it doesn't resolve the ask
+  (a deliberate simplification -- the old design would have kept trusting
+  a snapshot of the tapper's account_type from the moment they tapped,
+  which this rewrite has no equivalent of).
+- **No `card_id` cross-check needed in the matching predicate.** The old
+  design read a shared stream of every event this agent received and had
+  to filter down to `card_interaction` rows whose OWN `card_id` matched
+  the one being asked about. Reading `GET /api/v1/cards/:id` for a
+  specific card already scopes every row in the response to that one
+  card, so there is nothing left to filter on that axis.
+
+**A 429 from the card read degrades to a pending result with a wait
+hint**, rather than raising -- this is the one status this single-shot
+check treats as "try again" rather than "something is wrong", since the
+natural response (re-invoke with the same `card_id` shortly) is exactly
+what a genuine "no tap yet" result already asks the caller to do. Every
+other status still raises normally, same as before.
 
 ## Genuine push is out of scope for this package
 
@@ -136,7 +223,7 @@ in this package remain the correct ON-DEMAND-READ half of that pairing
 replacement for the push half. See README.md's "Push vs. on-demand"
 section for the user-facing version of this.
 
-## File-based cursor state
+## File-based cursor state (now Salt Read Updates only)
 
 `_salt_common.PersistentCursor` is a one-integer JSON file under
 `~/.salt/agents/<agent_id>/langflow/<purpose>/cursor.json` (override root
@@ -148,39 +235,34 @@ files never collide with a socket-mode `Agent`'s own files for the same
 agent id, if both happen to run against the same account on the same
 machine.
 
-**`<purpose>` is `sc.SHARED_POLL_PURPOSE` ("poll") for BOTH Salt Ask Human
-and Salt Read Updates (fixed 2026-09-22, was two separate purposes,
-`"ask_human"`/`"listen"`; the constant keeps its old name across the same
-day's later "no polling, ever" rewrite -- it still names the one shared
-cursor file, even though nothing in this module polls with it anymore).**
-They must share one file, not "never share," because salt-api keeps
-exactly ONE ack per agent (`users.agent_updates_acked_id`), not one per
-local purpose string: a check with `after=X` moves the server's stored
-ack to `max(current_ack, X)`, and every subsequent check -- from ANY
-caller, local file or not -- gets served from that resolved position. Two
-separate local cursor files used to imply two independent positions that
-don't actually exist server-side; if one component's check advanced the
-real (shared) ack past rows the OTHER component's own, staler local file
-still expected to see, that request got silently resolved past them and
-never saw them at all -- not a "wastes time re-scanning" problem, a
-genuine missed-event bug. Sharing one file makes this package's own
-bookkeeping match the one true position the server already enforces.
+**`<purpose>` is `sc.READ_UPDATES_POLL_PURPOSE` ("read_updates"), and Salt
+Read Updates is the only component in this package that constructs a
+`PersistentCursor` at all (as of 2026-09-26).** Until that date, this
+purpose was `sc.SHARED_POLL_PURPOSE` ("poll") and was shared with Salt
+Ask Human, on the reasoning that salt-api keeps exactly ONE ack per agent
+(`users.agent_updates_acked_id`), not one per local purpose string, so
+two separate local cursor files would have implied two independent
+positions that don't actually exist server-side. Salt Ask Human no longer
+polls this outbox at all (see "Salt Ask Human reads its own card, not the
+shared outbox" above), so there is only one caller of this cursor left,
+and nothing left to share it with. `SHARED_POLL_PURPOSE` is kept as an
+alias of the new constant for one release, in case anything outside this
+package's own components imported the old name directly.
 
-**This does NOT make it safe to run Salt Ask Human and Salt Read Updates
-concurrently against the same agent_id** (nor two `Ask Human` calls
-concurrently, e.g. two parallel flow runs checking on two different
-questions on the same agent). The underlying constraint is "one caller at
-a time per agent" -- sharing the cursor file removes a MISLEADING
-appearance of independence, it does not add mutual exclusion. There is no
+**This does NOT make it safe to run two Salt Read Updates checks (or a
+Read Updates check beside any other consumer of this agent's outbox, such
+as a socket-mode `Agent`) concurrently against the same agent_id.** The
+underlying constraint is "one caller at a time per agent" -- there is no
 lock here (a Langflow component has no natural place to hold one across
 concurrent flow executions); if your deployment genuinely needs
-concurrent on-demand checks against one Salt agent, serialize it at the
-flow-orchestration level, not inside this package.
+concurrent on-demand checks against one Salt agent's outbox, serialize it
+at the flow-orchestration level, not inside this package. (Salt Ask
+Human, since 2026-09-26, has no such constraint at all -- see above.)
 
 This is otherwise a **performance optimization, not a correctness
 requirement** in the ordinary (single-caller) case: every `check_for_event`
-call matches on something specific (a card_id, a requested event type),
-so re-scanning old history would just waste time, never produce a wrong
+call matches on something specific (a requested event type), so
+re-scanning old history would just waste time, never produce a wrong
 answer. A missing or corrupt cursor file is treated as "start from 0" and
 the next check just re-scans -- never a hard failure.
 
@@ -192,13 +274,15 @@ nothing in this package actually uses them:
 - Sending a message needs recipients' **public** keys only (fetched live
   from the chat's member list -- see `_salt_common.send_message`) -- a
   sender never needs its own private key to encrypt *to* someone else.
-- A card tap, a payment confirmation, a chat-opened notice, a hand-off
-  notice -- every event `_salt_common.check_for_event` can return -- arrive
-  as **plain structured JSON**, never PGP ciphertext. Salt's own card
-  protocol is deliberately unencrypted metadata (who tapped what, when);
-  only message *bodies* are end-to-end encrypted. So even Salt Ask Human,
-  whose whole job is "read the human's answer", never needs to decrypt
-  anything -- there is nothing encrypted to decrypt in a button tap.
+- A card tap (whether read from a card's own interaction log, as Salt Ask
+  Human does since 2026-09-26, or from an event `_salt_common.
+  check_for_event` returns), a payment confirmation, a chat-opened
+  notice, a hand-off notice -- all arrive as **plain structured JSON**,
+  never PGP ciphertext. Salt's own card protocol is deliberately
+  unencrypted metadata (who tapped what, when); only message *bodies* are
+  end-to-end encrypted. So even Salt Ask Human, whose whole job is "read
+  the human's answer", never needs to decrypt anything -- there is
+  nothing encrypted to decrypt in a button tap.
 - A payment request is a plain API record on the TransferRequest rail; no
   PGP involved at either end.
 
@@ -235,18 +319,20 @@ this whole package that is genuinely, not just conventionally, optional.
   real card-block validation. Nobody has run any of these six components
   against a live Salt account yet. See `HANDOFF.md`'s UAT steps before
   calling any of them production-ready.
-- **Ask Human's check and Read Updates' check are single-process,
-  single-flow-run concerns.** If two flow runs for the same agent overlap
-  in time (two concurrent Ask Human calls, or an Ask Human call racing a
-  Read Updates call), they call `GET /api/v1/agent/updates` against the
-  SAME shared cursor file (see "File-based cursor state" above) and could
-  race writing it (last write wins, no locking) -- a message consumed by
-  one could advance the cursor out from under a check the other has
-  in flight. This has not come up in practice (a Langflow flow run is not
-  typically fanned out concurrently against one agent), but if it becomes
-  a real scenario, either give each call site its own cursor file (for
-  example, suffixed by the card_id) or add simple file locking to
-  `PersistentCursor`.
+- **Read Updates' check is still a single-process, single-flow-run
+  concern (Ask Human's no longer is, as of 2026-09-26).** If two flow
+  runs for the same agent overlap in time and both call Salt Read
+  Updates, they read/write the SAME local cursor file (see "File-based
+  cursor state" above) and could race writing it (last write wins, no
+  locking) -- a row consumed by one could advance the cursor out from
+  under a check the other has in flight, and both still share salt-api's
+  one true per-agent ack regardless of the local file. This has not come
+  up in practice (a Langflow flow run is not typically fanned out
+  concurrently against one agent's Read Updates), but if it becomes a
+  real scenario, either give each call site its own cursor file or add
+  simple file locking to `PersistentCursor`. Salt Ask Human has no
+  equivalent concern any more: it reads its own card by id, which is not
+  shared state between calls at all.
 - **No `Data`-typed second output on Ask Human.** The brief allowed one
   (`Message` for the answer plus an optional structured `Data` output);
   this build keeps it to one output (`Message`) with the structured

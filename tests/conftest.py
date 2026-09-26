@@ -39,7 +39,30 @@ class FakeSaltClient:
         self.get_chat_response: dict[str, Any] = {"session": {"encrypted": True, "users": []}, "messages": []}
         self.post_message_response: dict[str, Any] = {"id": "msg-1"}
         self.post_plain_message_response: dict[str, Any] = {"id": "msg-plain-1"}
-        self.post_card_response: dict[str, Any] = {"id": "card-1"}
+        # The REAL POST /api/v1/cards response shape (salt-api 0.96.1): the
+        # card's chat BUBBLE, not the card record -- `message_id` (the
+        # bubble's own id) and `resource_id` (the card's own id, what GET/
+        # PATCH /api/v1/cards/:id read and update), plus `resource` (the
+        # card's own as_chat_resource payload, which separately carries an
+        # `id` matching `resource_id`). There is NO top-level `id` here --
+        # a earlier version of this fake modeled `{"id": "card-1"}`, which
+        # is not a shape salt-api ever actually returns, and hid a real
+        # `card["id"]` read bug in ask_human.py for as long as that fake
+        # was in place. See _salt_common.card_id_from_post.
+        self.post_card_response: dict[str, Any] = {
+            "message_id": "msg-card-1",
+            "resource_id": "card-1",
+            "resource": {"id": "card-1", "card_type": "blocks", "state": {}, "owner": {}},
+        }
+        # The REAL GET /api/v1/cards/:id response shape (salt-api 0.96.0):
+        # {id, state, owner_id, interactions: [...]}, interactions newest
+        # first -- see CardInteraction#as_json_for_owner. Consumed via
+        # FakeSaltClient._request (below), matching how
+        # _salt_common.get_card actually reaches SaltClient -- there is no
+        # public get_card method on the real SDK either, so faking a
+        # get_card METHOD here would test a call shape the real code never
+        # makes.
+        self.get_card_response: dict[str, Any] = {"id": "card-1", "state": {}, "owner_id": "agent-self", "interactions": []}
         self.request_payment_response: dict[str, Any] = {"id": "req-1"}
         self.get_chat_subscription_response: dict[str, Any] = {"chat_id": "chat-1", "mode": "addressed", "keywords": []}
         self.set_chat_subscription_response: dict[str, Any] = {"chat_id": "chat-1", "mode": "addressed", "keywords": []}
@@ -48,6 +71,11 @@ class FakeSaltClient:
         # round (or repeats the last one once the list is exhausted).
         self.update_rounds: list[dict[str, Any]] = [{"updates": [], "cursor": 0}]
         self._round_index = 0
+        # A raised exception (or a callable returning one) that the NEXT
+        # `_request` call raises instead of returning `get_card_response` --
+        # lets a test script a 429 (or any other SaltApiError) from the
+        # card-read path without needing a second fake method.
+        self.get_card_error: Exception | None = None
 
     def _record(self, name: str, *args: Any, **kwargs: Any) -> None:
         self.calls.append((name, args, kwargs))
@@ -111,6 +139,21 @@ class FakeSaltClient:
         self._round_index += 1
         return round_
 
+    def _request(self, method: str, path: str, api_key: str, json_body: Any = None, **kwargs: Any) -> Any:
+        """Stands in for `saltapp.client.SaltClient._request` -- the one
+        real method `_salt_common.get_card` calls (there is no public
+        `get_card` on the real SDK either; see that function's own
+        docstring for why). Only the one path this package's own code
+        actually reaches through `_request` is wired up here: a card
+        read. Anything else hitting this is a test writing a call this
+        package's production code does not make."""
+        self._record("_request", method, path, api_key, json_body=json_body, **kwargs)
+        if method == "GET" and path.startswith("/api/v1/cards/"):
+            if self.get_card_error is not None:
+                raise self.get_card_error
+            return self.get_card_response
+        raise AssertionError(f"FakeSaltClient._request has no fake response wired up for {method} {path}")
+
 
 def sign_body(body: dict[str, Any], secret: str = WEBHOOK_SECRET, *, timestamp: int | None = None) -> tuple[dict, str]:
     """The exact `X-Salt-Signature: t=..,v1=..` scheme saltapp.webhook checks.
@@ -145,6 +188,47 @@ def signed_update_row(
         "delivery_id": delivery_id,
         "created_at": "2026-09-18T00:00:00Z",
     }
+
+
+def card_interaction(
+    interaction_id: int,
+    *,
+    action_id: str,
+    user_id: str,
+    created_at: str = "2026-09-26T00:00:00Z",
+    transfer_request_id: str | None = None,
+    transfer_request_status: str | None = None,
+) -> dict[str, Any]:
+    """One row of `GET /api/v1/cards/:id`'s `interactions` array, exactly
+    as `CardInteraction#as_json_for_owner` shapes it: `{id, user_id,
+    action_id, value, created_at}`, plus `transfer_request_id`/
+    `transfer_request_status` only when the tap produced a real
+    TransferRequest (a "pay" button -- Salt Ask Human never posts one of
+    those, but the shape is modeled here for completeness/parity with
+    salt-mcp's and saltapp-agentkit's identical fakes). Callers build a
+    LIST of these, newest first (matching the real route's `order(
+    created_at: :desc, id: :desc)`), and set it as
+    `FakeSaltClient.get_card_response["interactions"]`.
+    """
+    row: dict[str, Any] = {
+        "id": interaction_id,
+        "user_id": user_id,
+        "action_id": action_id,
+        "value": None,
+        "created_at": created_at,
+    }
+    if transfer_request_id is not None:
+        row["transfer_request_id"] = transfer_request_id
+        row["transfer_request_status"] = transfer_request_status
+    return row
+
+
+def chat_member(user_id: str, *, username: str, account_type: str = "User") -> dict[str, Any]:
+    """One row of a chat's member list, the fields Salt Ask Human's tap
+    classification actually reads (`id`, `account_type`, `username`) --
+    salt-api's own `SAFE_USER_FIELDS` carries more (display_name,
+    public_key, ...), trimmed here to what this package's tests need."""
+    return {"id": user_id, "username": username, "account_type": account_type}
 
 
 @pytest.fixture(autouse=True)

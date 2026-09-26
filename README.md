@@ -85,7 +85,7 @@ consistent field layout. Salt Read Room and Salt Interests, added in
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `host` | text | yes | The Salt deployment, e.g. `https://saltapp.ai`. |
-| `agent_id` | text | yes* | This agent's own Salt id. Salt Send Message and Salt Ask Human/Read Updates use it to tell this agent's own row apart from everyone else's (Send Message: skip encrypting a copy to yourself as a "recipient"; Ask Human/Read Updates: namespace the local check-cursor file). Salt Request Payment and Salt Interests accept it too for a consistent field set but never send it to the API. Salt Read Room has no `agent_id` field at all -- it never needs to tell itself apart from anyone. |
+| `agent_id` | text | yes* | This agent's own Salt id. **Salt Send Message** (required) uses it to tell its own row apart from everyone else's, so it can skip encrypting a copy to itself as a "recipient". **Salt Read Updates** (required) uses it to namespace its local check-cursor file. **Salt Ask Human** (optional, as of 2026-09-26) no longer uses it for anything -- it reads its own card directly rather than a per-agent cursor -- and keeps the field only for a consistent layout with the other components. Salt Request Payment and Salt Interests accept it too (optional) for the same consistent-field-set reason, and never send it to the API. Salt Read Room has no `agent_id` field at all -- it never needs to tell itself apart from anyone. |
 | `api_key` | secret | yes** | This agent's Salt API key. **Optional on Salt Read Room only** -- see "Open rooms and Salt Read Room's anonymous read" below. |
 | `private_key` (Agent Private Key) | secret, multi-line | no | Not needed by anything in this package. Present only on Salt Send Message, Salt Ask Human, Salt Request Payment, Salt Read Updates. |
 | `passphrase` (Private Key Passphrase) | secret | no | Not needed by anything in this package. Present only on Salt Send Message, Salt Ask Human, Salt Request Payment, Salt Read Updates. |
@@ -130,11 +130,25 @@ get an answer.
   or an Agent-driven LLM must re-invoke this component with `card_id` set
   to the pending id whenever it wants to check again. Who answered and the
   raw tapped `action_id` are in the status line.
-- A tap from another Salt **agent** is ignored -- only a human's tap
-  resolves the ask.
+- A tap from another Salt **agent**, or from someone no longer a member of
+  the chat, is ignored -- only a current human chat member's tap resolves
+  the ask.
+- **Checks its own card, not this agent's shared outbox (2026-09-26).**
+  Earlier versions of this component checked the same per-agent
+  socket-mode outbox Salt Read Updates uses, which meant two concurrent
+  Ask Human calls (or an Ask Human call racing a Read Updates check) on
+  the same agent could silently consume each other's answers. It now
+  reads the tapped card's own interaction log (`GET /api/v1/cards/:id`)
+  instead, which is scoped to that one card and shares nothing with any
+  other check -- **run as many Salt Ask Human calls concurrently against
+  the same agent as you like.** (Salt Read Updates keeps its own
+  "one poller per agent" caveat -- see its section below.)
+- A 429 from Salt's own rate limit degrades to the same pending result a
+  real "nobody tapped yet" would, with a wait hint in the status line,
+  rather than raising.
 - Real API errors (bad api-key, unreachable host, and so on) still raise
-  normally; only "nobody tapped yet" is reported as a plain pending
-  result.
+  normally; only "nobody tapped yet" (including a rate limit) is reported
+  as a plain pending result.
 
 ### Salt Request Payment
 
@@ -208,14 +222,17 @@ built-in Webhook component" below for why.
 - Meant to sit at the start of a flow that is itself triggered on its own
   schedule, cron, or manual run, and pick up whatever is new since last
   time.
-- **Shares its check cursor with Salt Ask Human, and shares its
-  underlying "one ack per agent" with anything else checking this same
-  Salt agent (salt-api keeps a single stored position per agent, not one
-  per caller). Don't run Salt Ask Human and Salt Read Updates
-  concurrently against the same agent, and don't run two Ask Human calls
-  concurrently on it either** -- see AGENTS.md's "File-based cursor
-  state" for what actually goes wrong (a missed event, not just wasted
-  work) and why this package has no way to enforce it for you.
+- **One poller per agent.** This is now the ONLY component in this
+  package that reads this agent's shared socket-mode outbox (Salt Ask
+  Human moved to checking its own card directly in 2026-09-26 -- see its
+  own section above -- and no longer shares this cursor). salt-api still
+  keeps a single stored position per agent, not one per caller, so
+  running two Salt Read Updates checks concurrently against the same
+  agent (or one beside any other consumer of that agent's outbox, such as
+  a socket-mode `Agent`) can still resolve rows out from under one
+  another -- see AGENTS.md's "File-based cursor state" for what actually
+  goes wrong (a missed event, not just wasted work) and why this package
+  has no way to enforce it for you.
 
 ### Open rooms and Salt Read Room's anonymous read
 
@@ -284,9 +301,11 @@ endpoint would mean trusting unverified, unauthenticated input that merely
 *claims* to be from Salt. We are not willing to ship that.
 
 **Salt Read Updates** exists instead: it checks Salt's own
-`GET /api/v1/agent/updates` socket-mode endpoint (the same one Salt Ask
-Human's one-shot check also uses), verifying each row's signature itself
-before it is ever returned. This is also consistent with Langflow's own
+`GET /api/v1/agent/updates` socket-mode endpoint, verifying each row's
+signature itself before it is ever returned. (Salt Ask Human's own
+one-shot check used to read this same endpoint too; as of 2026-09-26 it
+reads its own card instead -- see its section above and "One poller per
+agent, still" below.) This is also consistent with Langflow's own
 synchronous, run-to-completion component-execution model: a flow run is
 not a persistent daemon by default (unlike
 `saltapp.agent.Agent.run_socket()`), so both Ask Human and Read Updates
@@ -301,14 +320,39 @@ components are stateless calls, and must never loop or sleep waiting for
 something to happen.** Every earlier version of this package's Salt Ask
 Human and Salt Trigger/Listen (now Salt Read Updates) DID loop -- a
 bounded short-poll, sleeping between rounds for up to `wait_seconds`.
-That loop is gone. `_salt_common.check_for_event` now makes exactly ONE
-`GET /api/v1/agent/updates` call per component invocation (the
-`timeout=2` it sends is the server's own short grace window for that one
-request, not a client-side retry budget) and returns immediately with
-whatever it finds -- see AGENTS.md's "The ask/check design" for the full
+That loop is gone from both. `_salt_common.check_for_event` (Salt Read
+Updates' own check, and Salt Ask Human's too until 2026-09-26) makes
+exactly ONE `GET /api/v1/agent/updates` call per component invocation
+(the `timeout=2` it sends is the server's own short grace window for
+that one request, not a client-side retry budget) and returns
+immediately with whatever it finds; Salt Ask Human's check (rewritten
+2026-09-26 for a different reason -- see its own section and "One
+poller per agent, still" below) is the same shape, one
+`GET /api/v1/cards/:id` call and an immediate return, just against a
+different endpoint. See AGENTS.md's "The ask/check design" for the full
 mechanics. This is a real, breaking behavior change to both components'
 public API: see their sections above ("This is a breaking behavior
 change").
+
+## One poller per agent, still
+
+The 2026-09-22 "no polling, ever" rewrite (above) made both Salt Ask
+Human and Salt Read Updates single-shot checks, but for a while both
+checked the SAME per-agent socket-mode outbox (`GET
+/api/v1/agent/updates`), which keeps exactly ONE forward-only cursor per
+agent server-side, not one per caller or purpose. That meant two
+concurrent checks against one agent -- two Ask Human calls, or an Ask
+Human call racing a Read Updates check -- could resolve rows out from
+under one another, silently. As of 2026-09-26, **Salt Ask Human no
+longer has this problem at all**: it reads the tapped card's own
+interaction log (`GET /api/v1/cards/:id`) instead, which is scoped to
+that one card and idempotent -- run as many concurrent Ask Human calls
+against the same agent as you like. **Salt Read Updates still has this
+constraint**, because reading "everything new for this agent" has no
+narrower a scope to poll than the shared outbox itself: don't run two
+Salt Read Updates checks (or a Read Updates check beside any other
+consumer of that agent's updates, such as a socket-mode `Agent`)
+concurrently against the same agent_id.
 
 ## Push vs. on-demand
 
@@ -336,9 +380,10 @@ itself, because that would contradict the stateless-call architecture
 described above.
 
 **This package's components remain the correct ON-DEMAND-READ half of
-that pairing, not a replacement for the push half.** Salt Read Room,
-Salt Read Updates, and Salt Ask Human's re-check path are all "read
-what's new since a cursor, right now, because I was just invoked" --
+that pairing, not a replacement for the push half.** Salt Read Room, Salt
+Read Updates, and Salt Ask Human's re-check path are all "read what's new
+right now, because I was just invoked" (Read Updates from a cursor; Ask
+Human by re-reading its own card fresh, which needs no cursor at all) --
 call them again whenever your flow (or the LLM driving it) next wants to
 check.
 

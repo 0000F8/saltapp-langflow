@@ -14,6 +14,18 @@
 # triggered on its own schedule/cron/manual run and pick up whatever is
 # new since last time. Genuine push needs a persistent process outside
 # this package; see README.md's "Push vs. on-demand" section.
+#
+# ONE POLLER PER AGENT, still, even after 2026-09-26: this is now the
+# ONLY component in this package that reads GET /api/v1/agent/updates
+# (Salt Ask Human moved to reading its own card directly and no longer
+# shares this cursor -- see _salt_common.get_card's docstring and
+# HANDOFF.md's 2026-09-26 entry). salt-api keeps exactly ONE
+# `agent_updates_acked_id` per agent, not one per caller, so running two
+# concurrent checks against the SAME agent_id (two Read Updates calls, or
+# one beside a socket-mode Agent/any other consumer of that agent's
+# outbox) can still resolve rows out from under one another. Never wire
+# this component into Salt Ask Human's check -- Ask Human must keep
+# reading its own card, never this outbox.
 from __future__ import annotations
 
 from typing import Any
@@ -38,7 +50,10 @@ class SaltReadUpdatesComponent(Component):
     display_name = "Salt Read Updates"
     description = (
         "Check once for this agent's new Salt events (message, card tap, payment, chat opened, or "
-        "hand-off) since the last check, verifying each one's signature first."
+        "hand-off) since the last check, verifying each one's signature first. "
+        "ONE POLLER PER AGENT: this agent has a single shared position server-side, so running this "
+        "concurrently with another Read Updates check (or any other consumer of this agent's updates) "
+        "against the same agent can silently miss events."
     )
     icon = "radio"
     name = "SaltReadUpdates"
@@ -105,12 +120,14 @@ class SaltReadUpdatesComponent(Component):
                     return False
                 return not wanted or event.type in wanted
 
-            # Shared with Salt Ask Human's own cursor -- see
-            # sc.SHARED_POLL_PURPOSE's docstring: there is only one ack
-            # per agent server-side, so this package's local bookkeeping
-            # matches that instead of pretending each component has its
-            # own.
-            cursor = sc.PersistentCursor(sc.state_dir(agent_id, sc.SHARED_POLL_PURPOSE) / "cursor.json")
+            # This package's own local mirror of the one true position
+            # salt-api keeps for this agent (see
+            # sc.READ_UPDATES_POLL_PURPOSE's docstring) -- not shared with
+            # any other component in this package any more (Salt Ask
+            # Human no longer polls this outbox at all), but still not
+            # safe to run concurrently with another consumer of the same
+            # agent's outbox; see this module's own header comment.
+            cursor = sc.PersistentCursor(sc.state_dir(agent_id, sc.READ_UPDATES_POLL_PURPOSE) / "cursor.json")
             events, _new_cursor = sc.check_for_event(
                 client,
                 self.api_key,

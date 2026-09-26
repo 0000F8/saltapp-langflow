@@ -1,5 +1,161 @@
 # HANDOFF.md
 
+## 2026-09-26 Salt Ask Human polls its own card, not the shared outbox (`lane/card-poll`)
+
+Branch `lane/card-poll`. A workspace-wide fix: the same bug class was
+found and fixed the same day in salt-mcp (`pollForCardInteraction`/
+`getCard`, `ask_human`/`get_ask_result`), saltapp-agentkit
+(`ask_poll.py`, both languages), and now here. Real end-to-end test
+count: **32 -> 34 passing** (`.venv/bin/python -m pytest -q` from the
+repo root):
+
+```
+34 passed, 22 warnings in 0.75s
+```
+
+(same pre-existing third-party deprecation warnings as every earlier
+entry in this file -- pgpy/cryptography/pydantic, nothing from this
+package's own code.)
+
+### The bug class
+
+Salt Ask Human's one-shot "did anyone tap yet" check (and, before
+2026-09-22's no-polling rewrite, its wait loop) read the SAME per-agent
+socket-mode outbox (`GET /api/v1/agent/updates`) that Salt Read Updates
+checks, sharing one local cursor file (`sc.SHARED_POLL_PURPOSE`,
+`test_shared_cursor.py`). salt-api keeps exactly ONE forward-only
+`agent_updates_acked_id` per agent server-side, not one per caller or
+purpose (`after=0` and omitting `after` are the same request; the ack
+only ever advances to `max(current_ack, after)`, from whoever sent it).
+Two independent problems fell out of that for an on-demand, stateless
+Langflow component specifically:
+
+1. Two concurrent Salt Ask Human calls against the same agent (two
+   parallel flow runs, or two parallel tool calls in one Agent-driven
+   LLM turn) each posted their OWN distinct card, but both checked the
+   SAME shared cursor for a tap -- whichever checked first could advance
+   the ack past a tap meant for the OTHER card, and that tap was then
+   gone for good. Not a performance problem: a genuine missed answer.
+2. A Salt Ask Human check racing a Salt Read Updates check on the same
+   agent had the identical problem in the other direction.
+
+### The fix
+
+`_salt_common.get_card` (new): `GET /api/v1/cards/:id` -- one card's own
+interaction log, owner-only, `interactions` newest-first, capped at 50
+server-side. Reading one card by id is idempotent and shares nothing with
+any other ask: any number of concurrent Salt Ask Human calls, for this
+agent or any other, can each resolve their own ask independently now.
+Mirrors salt-mcp's `getCard`/`pollForCardInteraction` and
+saltapp-agentkit's Python `_get_card`/`poll_for_answer` -- read both
+before writing this (per the task brief), and the design here is
+deliberately close to both, adapted for the one real difference: a
+Langflow component's build method must still make exactly ONE check and
+return (the 2026-09-22 "no polling, ever" rule), never a wait loop like
+either of those two references keeps. There is no public `get_card`
+method on `saltapp.client.SaltClient` as of saltapp 0.3.2 (confirmed --
+no `def get_card` anywhere in that package), and this deliberately does
+not add one: another lane in this workspace owns `saltapp-python` and may
+be mid-edit on it, so `get_card` goes through `client._request`, the same
+underlying method every public `SaltClient` method is already built on --
+exactly how saltapp-agentkit's own `_get_card` reached past its SDK for
+the identical reason the same day.
+
+`ask_human.py`'s matching predicate changed shape along with the read
+target, because `CardInteraction#as_json_for_owner` (`{id, user_id,
+action_id, value, created_at}`) carries strictly less than the old
+outbox event body did -- no `account_type`, no `username`. Salt Ask
+Human's one behavioral guarantee (an agent's tap never resolves a human
+ask) now needs the chat's member list (`client.get_chat_members`,
+fetched fresh per check, and ONLY when there is at least one interaction
+to classify) cross-referenced against each tap's `user_id`. A tapper no
+longer a member of the chat is treated the same as an agent's tap -- a
+deliberate simplification from the old design, which trusted a snapshot
+of the tapper's account_type from the moment they tapped; see AGENTS.md's
+new section for the fuller reasoning. The `card_id` field the component
+already exposed to a flow (from a fresh post's `sc.card_id_from_post`, or
+supplied back in on a re-check) remains the entire resumable state --
+unlike salt-mcp's/saltapp-agentkit's opaque base64 `ask_id` token (which
+those need because an MCP tool call/AgentKit action has no other place to
+carry `chat_id`/`options` across calls), a Langflow component's OWN input
+fields already carry `chat_id` and `options` fresh on every invocation, so
+inventing a second opaque continuation value here would just duplicate
+state the component already has a real field for.
+
+**A real, separate bug fixed along the way**: `card.get("id")` (used to
+extract a freshly-posted card's id) was never a key salt-api's
+`POST /api/v1/cards` response actually carries -- that response is the
+card's chat BUBBLE (`message_id`, `resource_id`, `resource: {id, ...}`),
+never a top-level `id`. `tests/conftest.py`'s `post_card_response` fake
+modeled the wrong shape (`{"id": "card-1"}`) since this repo's very first
+commit, which is exactly why no test ever caught it: `card.get("card_id")
+or card.get("id")` (the old code) read `None` from both keys against the
+real API and would have failed with "Salt did not return a card id" on
+every single real invocation. Fixed via the new `sc.card_id_from_post`
+(`card.get("resource_id") or (card.get("resource") or {}).get("id")`,
+mirroring salt-mcp's `postCardTool` and saltapp-agentkit's identical
+fix), and the fake corrected to the real shape.
+
+### `read_updates.py`: kept, not touched structurally
+
+Decided to KEEP `read_updates.py` (`SaltReadUpdatesComponent`) rather than
+delete it: README.md documents a real, distinct use for it ("a second,
+separate flow can use Salt Read Updates at its start, triggered on a
+schedule... to pick up whatever happened on Salt since its last run --
+new messages, taps, payments -- and act on it"), which is a genuinely
+different job from Ask Human's "did THIS specific card get tapped" --
+Read Updates answers "what's new for this agent at all", which has no
+narrower scope to check than the shared outbox itself. It is now the
+ONLY component in this package that reads `GET /api/v1/agent/updates` or
+constructs a `PersistentCursor`. Strengthened its warning in three
+places per the task brief: its own `description` string (shown in the
+Langflow component palette itself, not just prose docs), README.md's
+component section (rewritten as "One poller per agent" bullet), and
+AGENTS.md ("File-based cursor state" section rewritten to say Read
+Updates is now the sole owner of this cursor). It must never be used by
+Ask Human's check, and after this change it structurally cannot be --
+Ask Human's code path never touches `sc.check_for_event`, `sc.
+PersistentCursor`, or `sc.READ_UPDATES_POLL_PURPOSE` at all any more.
+
+`sc.SHARED_POLL_PURPOSE` is kept as a plain alias of the new `sc.
+READ_UPDATES_POLL_PURPOSE` for one release, in case anything outside this
+package's own components imported the old name directly (nothing inside
+this package does, after this pass).
+
+### Capability lost: none for a real deployment; one test-suite simplification
+
+Nothing a real Salt account could do before is now impossible. The one
+thing that changed behaviorally: a tapper who left the chat between
+tapping and the next check no longer resolves the ask (see above) --
+this is a narrower, more conservative behavior than before (fails toward
+"still pending" rather than trusting stale membership data), not a
+capability removed from a working flow.
+
+### What was NOT done, and why
+
+- **No free-text-reply fallback**, unlike saltapp-agentkit's Python
+  provider (which also reads the chat itself, via a PGP private key, for
+  a plain-text answer alongside the button tap). Salt Ask Human's
+  `private_key`/`passphrase` fields remain present-but-unused, exactly as
+  AGENTS.md's "The keyless boundary" section already documented and
+  intended -- this component's whole design, from its first commit, is
+  "never needs to decrypt anything" (mirroring salt-mcp's button-only
+  design, not saltapp-agentkit's). Adding a decrypt path here would be a
+  real scope increase (a new required "who" input to resolve one specific
+  human, `restricted_to` on the buttons, wiring the dormant private-key
+  fields to `saltapp.crypto.decrypt` for the first time in this package,
+  and the security review that deserves) that the task brief's "if
+  applicable" left to this pass's judgment, not a mandate. Flagging it
+  here as a real, deliberate option for later rather than silently
+  dropping it.
+- **`ask_id` is not an opaque base64 token here** -- see "The fix" above
+  for why the existing `card_id` field already serves that purpose in
+  this codebase's actual shape.
+- Not pushed, no PR opened, no other repo touched, per the task's
+  instructions.
+
+---
+
 ## 2026-09-22 open rooms, no-polling rewrite (`lane/open-rooms`)
 
 Branch `lane/open-rooms`, built against the sibling `saltapp-python`
