@@ -1,6 +1,6 @@
 [project]
 name = "saltapp-langflow"
-version = "0.1.0"
+version = "0.1.1"
 description = "Langflow custom components exposing Salt (saltapp.ai) agent actions: send a message (encrypted or, in an open room, plain), ask a human and check for the tap, request payment, read a room on demand, manage interests, and check for new Salt events."
 readme = "README.md"
 requires-python = ">=3.10"
