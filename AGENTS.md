@@ -4,9 +4,11 @@ Design notes for whoever works on this repo next.
 
 ## What this is
 
-Six Langflow custom components (`saltapp_langflow/`) exposing a slice of
-[Salt](https://saltapp.ai)'s agent actions inside a Langflow flow, built
-on the [`saltapp`](https://github.com/0000F8/saltapp-python) Python SDK:
+[Salt](https://saltapp.ai) is an end-to-end encrypted chat where humans
+and AI agents are equal contacts. Six Langflow custom components
+(`saltapp_langflow/`) expose a slice of an agent's Salt actions inside a
+Langflow flow, built on the
+[`saltapp`](https://github.com/0000F8/saltapp-python) Python SDK:
 `SaltSendMessageComponent`, `SaltAskHumanComponent`,
 `SaltRequestPaymentComponent`, `SaltReadUpdatesComponent` (was
 `SaltListenComponent`), `SaltReadRoomComponent`, `SaltInterestsComponent`.
@@ -21,6 +23,49 @@ Interests were added because saltapp-python 0.2.0 changed the underlying
 contract this package wraps, not as a default -- if a real need shows up
 for one of the Dify plugin's other actions here, that is a separate,
 deliberate decision.
+
+## Commands
+
+All from the repo root (Python 3.10+, setuptools via `pyproject.toml`).
+Verified 2026-09-27 -- `pip install -e ".[dev]"` then `pytest` passed
+clean (`34 passed`):
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate   # first time only
+pip install -e ".[dev]"    # editable install; pulls lfx+pytest and
+                            # saltapp from git+...saltapp-python@main
+pytest                     # -q for quiet; every test mocks SaltClient
+                            # (see "Known limitations" below)
+```
+
+No lint/format/type-check tool is configured (`pyproject.toml` declares
+none, and there is no `.ruff.toml`/`.flake8`/etc. in the repo) and there
+is no separate build step beyond the editable install above. `pip
+install -e ".[dev]"` re-resolves the `saltapp` git dependency to
+whatever is current on its `main` branch every time -- if a component's
+behavior seems to have shifted for no local reason, check what
+`saltapp-python@main` changed first.
+
+## Layout
+
+- `saltapp_langflow/_salt_common.py` -- shared helpers every component
+  calls into: `send_message`/`send_encrypted_message`, `read_room`, the
+  card-poll helpers behind Salt Ask Human (`get_card`,
+  `card_id_from_post`), and the outbox-check helper behind Salt Read
+  Updates (`check_for_event`, `PersistentCursor`).
+- `saltapp_langflow/{send_message,ask_human,request_payment,read_room,
+  read_updates,interests}.py` -- the six components themselves, one file
+  each, each a thin `lfx` `Component` subclass wrapping
+  `_salt_common.py`.
+- `tests/conftest.py` -- `FakeSaltClient`, the hand-written fake every
+  test builds instead of hitting a live salt-api; see "Rules that bite"
+  below for why its response shapes must match salt-api exactly.
+- `README.md` -- the user-facing surface: install, each component's
+  fields, the no-polling/push-vs-on-demand design, a worked example flow.
+- `HANDOFF.md` -- the dated, chronological build log: what changed, why,
+  what was tested, UAT steps against a real account, what's left undone.
+- `pyproject.toml` -- the setuptools build, the `saltapp` git dependency
+  (not yet on PyPI), and the `dev` extra (`lfx`, `pytest`).
 
 ## Why no `Identity`/`Agent`/`saltapp.integrations` classes
 
@@ -308,6 +353,79 @@ message" component might -- so there is no present-but-unused field to
 keep. Salt Read Room's `api_key` is optional too (see "Open rooms and
 Salt Read Room's anonymous read" in README.md): it is the one field in
 this whole package that is genuinely, not just conventionally, optional.
+
+## Rules that bite
+
+Cross-repo facts about Salt's ask/answer and messaging contracts that
+have already bitten more than one of Salt's agent integrations, worth
+knowing before touching `ask_human.py`, `send_message.py`, or
+`read_room.py` again:
+
+- **A tool waiting for a human's answer polls its OWN card, never the
+  shared outbox.** This is the whole subject of "Salt Ask Human reads
+  its own card, not the shared outbox" above -- `GET
+  /api/v1/agent/updates` keeps exactly ONE forward-only cursor per agent,
+  server-side, and any `after=` a caller sends it permanently advances
+  that agent's stored ack, silently cutting off whatever backlog another
+  concurrent caller (another Ask Human card, a Read Updates check, a
+  socket-mode `Agent`) still needed. `GET /api/v1/cards/:id` has no such
+  shared position; see above for the full story.
+- **`POST /api/v1/cards`'s response is the chat MESSAGE it created, not
+  the card.** `message_id` is the bubble's own id; the card's own id
+  (what `GET`/`PATCH /api/v1/cards/:id` read and update) is
+  `resource_id` (also mirrored inside `resource: {id, ...}`). There is
+  NO top-level `id` on this response -- see `card_id_from_post()` in
+  `_salt_common.py`, and HANDOFF.md's 2026-09-26 entry for the bug this
+  repo actually shipped from reading `card["id"]` (a key that is never
+  present) instead.
+- **Test fakes must model salt-api's ACTUAL controller response shape,
+  not the calling code's assumption.** The `card["id"]` bug above shipped
+  identically across more than one downstream Salt integration at once,
+  each with its own hand-written test fake independently modeling the
+  same wrong shape -- a fake mirroring what the calling code expects,
+  rather than what the real controller returns, will pass every test and
+  still fail on the first real call. When touching `tests/conftest.py`,
+  check a response shape against the real endpoint (or a sibling repo's
+  already-fixed fake), never against what `_salt_common.py` currently
+  reads.
+- **A chat's `encrypted` flag lives nested under `session`, never
+  top-level.** `client.get_chat(...)["session"]["encrypted"]`, read as
+  `session.get("encrypted", True)` in `send_message()` (a missing key
+  defaults to encrypted, since every chat before saltapp 0.2.0's open
+  rooms had no such key at all) -- see README.md's "Open rooms and Salt
+  Read Room's anonymous read".
+- **Since salt-api 0.98.1, an encrypted chat refuses a non-PGP-armored
+  message body** (422, `"This room is encrypted. Messages must be sent
+  encrypted."`) -- relevant given Salt Read Room's open-room support:
+  Salt Send Message already routes around this correctly, checking
+  `session.encrypted` before choosing `post_plain_message` vs.
+  encrypting (the bullet above), but any future code path that posts
+  into a chat WITHOUT going through `send_message()` would hit this the
+  moment it tried to post plain text into an encrypted room.
+
+## Where the truth is
+
+- `https://saltapp.ai/api/openapi.json` -- salt-api's own OpenAPI schema,
+  the most current source for a request/response shape this doc doesn't
+  cover.
+- `https://saltapp.ai/agents.md` -- Salt's public, agent-facing overview
+  of the whole platform (not this package specifically).
+- `https://mcp.saltapp.ai/mcp` -- Salt's own hosted MCP server, useful as
+  a live reference for a tool/action this package also wraps.
+- `docs/CLIENTS.md` in the sibling `salt-mcp` repo -- the closest thing
+  to a cross-client survey of Salt integration gotchas outside this
+  repo's own `HANDOFF.md`.
+
+## Publishing
+
+Not published anywhere yet: no PyPI release for this package (checked
+2026-09-27: `pip index versions saltapp-langflow` finds nothing) and no
+listing in Langflow's own component registry/store. README.md's
+"Install" section installs straight from this repo's git URL or a local
+editable checkout for exactly that reason. This package's own dependency
+on `saltapp` is in the same state (git URL, not a version pin -- see
+`pyproject.toml`'s comment); a real release of either should follow
+`saltapp-python` shipping to PyPI first, not precede it.
 
 ## Known limitations
 
