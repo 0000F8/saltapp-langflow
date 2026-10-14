@@ -33,7 +33,7 @@ clean (`34 passed`):
 ```bash
 python3 -m venv .venv && source .venv/bin/activate   # first time only
 pip install -e ".[dev]"    # editable install; pulls lfx+pytest and
-                            # saltapp from git+...saltapp-python@main
+                            # saltapp>=0.6.0 from PyPI
 pytest                     # -q for quiet; every test mocks SaltClient
                             # (see "Known limitations" below)
 ```
@@ -41,10 +41,9 @@ pytest                     # -q for quiet; every test mocks SaltClient
 No lint/format/type-check tool is configured (`pyproject.toml` declares
 none, and there is no `.ruff.toml`/`.flake8`/etc. in the repo) and there
 is no separate build step beyond the editable install above. `pip
-install -e ".[dev]"` re-resolves the `saltapp` git dependency to
-whatever is current on its `main` branch every time -- if a component's
-behavior seems to have shifted for no local reason, check what
-`saltapp-python@main` changed first.
+install -e ".[dev]"` resolves `saltapp>=0.6.0` from PyPI -- if a component's
+behavior seems to have shifted for no local reason, check which `saltapp`
+release got resolved (`pip show saltapp`) and its changelog.
 
 ## Layout
 
@@ -64,8 +63,7 @@ behavior seems to have shifted for no local reason, check what
   fields, the no-polling/push-vs-on-demand design, a worked example flow.
 - `HANDOFF.md` -- the dated, chronological build log: what changed, why,
   what was tested, UAT steps against a real account, what's left undone.
-- `pyproject.toml` -- the setuptools build, the `saltapp` git dependency
-  (not yet on PyPI), and the `dev` extra (`lfx`, `pytest`).
+- `pyproject.toml` -- the setuptools build, the `saltapp>=0.6.0` dependency, and the `dev` extra (`lfx`, `pytest`).
 
 ## Why no `Identity`/`Agent`/`saltapp.integrations` classes
 
@@ -418,14 +416,10 @@ knowing before touching `ask_human.py`, `send_message.py`, or
 
 ## Publishing
 
-Not published anywhere yet: no PyPI release for this package (checked
-2026-09-27: `pip index versions saltapp-langflow` finds nothing) and no
-listing in Langflow's own component registry/store. README.md's
-"Install" section installs straight from this repo's git URL or a local
-editable checkout for exactly that reason. This package's own dependency
-on `saltapp` is in the same state (git URL, not a version pin -- see
-`pyproject.toml`'s comment); a real release of either should follow
-`saltapp-python` shipping to PyPI first, not precede it.
+PyPI: `python -m build` then `twine upload dist/*` (name `saltapp-langflow`; `saltapp>=0.6.0`
+is already on PyPI). There is no Langflow Store: the only "official" listing is a pull request
+to `langflow-ai/langflow` (see HANDOFF.md, "Listing"); until then operators point
+`LANGFLOW_COMPONENTS_PATH` at the pip-installed package (README, "Loading these components").
 
 ## Known limitations
 

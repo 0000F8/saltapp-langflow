@@ -9,14 +9,12 @@ all as drop-in nodes in a Langflow flow, built on the
 
 ## Install
 
-`saltapp` is not yet on PyPI (it will replace the git dependency below once
-it ships there), so install straight from source for now:
-
 ```bash
-pip install "saltapp-langflow @ git+https://github.com/0000F8/saltapp-langflow@main"
+pip install saltapp-langflow
 ```
 
-or, working from a local checkout of this repo:
+This installs the [`saltapp`](https://pypi.org/project/saltapp/) SDK (`>=0.6.0`) with it. To work
+from a local checkout of this repo instead:
 
 ```bash
 pip install -e .

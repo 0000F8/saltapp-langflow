@@ -9,18 +9,10 @@ authors = [{ name = "0x0000F8", email = "0000F8@proton.me" }]
 keywords = ["langflow", "salt", "saltapp", "agents", "human-in-the-loop"]
 
 dependencies = [
-    # saltapp is not yet on PyPI (see https://github.com/0000F8/saltapp-python) --
-    # this git dependency will be replaced by a normal version pin once it
-    # ships there. Floor is effectively >=0.2.0 (open rooms: get_chat's
-    # `last` cursor and no-api-key reads, post_plain_message,
-    # get_chat_subscription/set_chat_subscription/clear_chat_subscription)
-    # -- PEP 508 does not allow combining a version specifier with a
-    # direct URL reference, so that floor is documented here rather than
-    # pinned on the line below. Until saltapp-python's `lane/open-rooms`
-    # branch merges to its own `main`, local dev against this repo
-    # installs the sibling editable checkout instead of this git URL:
-    # `.venv/bin/pip install -e /path/to/saltapp-python`.
-    "saltapp @ git+https://github.com/0000F8/saltapp-python@main",
+    # Floor is 0.6.0: the first saltapp on PyPI (2026-10-14). Open rooms
+    # (get_chat's `last` cursor, post_plain_message, chat subscriptions)
+    # landed in 0.2.0 and are all in 0.6.0.
+    "saltapp>=0.6.0",
 ]
 
 [project.optional-dependencies]
